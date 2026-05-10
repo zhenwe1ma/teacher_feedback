@@ -1,0 +1,24 @@
+{
+  "name": "teacher-feedback-mvp",
+  "version": "0.1.0",
+  "private": true,
+  "description": "课堂录音转客户反馈 Web MVP",
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js",
+    "service:start": "bash scripts/service.sh start",
+    "service:stop": "bash scripts/service.sh stop",
+    "service:restart": "bash scripts/service.sh restart",
+    "service:status": "bash scripts/service.sh status",
+    "start:local-llm": "bash -lc 'export OLLAMA_HOST=127.0.0.1:11434; export OLLAMA_MODELS=$PWD/.ollama/models; ./.local/ollama/bin/ollama serve'",
+    "pull:qwen3.5-4b": "bash -lc 'export OLLAMA_HOST=127.0.0.1:11434; export OLLAMA_MODELS=$PWD/.ollama/models; ./.local/ollama/bin/ollama pull qwen3.5:4b'",
+    "start:local-llm:python": "python3 scripts/local_llm_server.py",
+    "smoke": "node scripts/smoke-test.js",
+    "test:generated-recording": "node scripts/test-generated-recording.js",
+    "test:real-recording": "node scripts/test-real-recording.js",
+    "check": "node --check server.js && node --check public/app.js && node --check scripts/smoke-test.js && python3 -m py_compile scripts/local_llm_server.py && node scripts/smoke-test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

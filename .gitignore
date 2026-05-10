@@ -1,0 +1,14 @@
+.env
+.venv/
+.pydeps/
+data/
+node_modules/
+.DS_Store
+*.log
+*.pyc
+__pycache__/
+.run/
+.local/
+.ollama/
+.pydeps_local_llm/
+.venv-local-llm/

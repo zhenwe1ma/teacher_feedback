@@ -1,0 +1,209 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>课堂录音转客户反馈</title>
+    <link rel="stylesheet" href="/styles.css" />
+  </head>
+  <body>
+    <div class="app-shell">
+      <header class="topbar">
+        <div class="brand-block">
+          <div class="brand-line">
+            <span class="brand-mark" aria-hidden="true"></span>
+            <div class="brand-copy">
+              <h1>课堂录音转客户反馈</h1>
+              <p class="brand-subtitle">教师工作台</p>
+            </div>
+            <p id="modeBadge" class="mode-badge">加载中</p>
+          </div>
+        </div>
+        <div class="header-meta">
+          <div id="accessLinks" class="access-links hidden"></div>
+          <div class="top-actions">
+            <button id="logoutButton" class="icon-button hidden" type="button">退出</button>
+            <button id="refreshButton" class="icon-button" type="button" title="刷新">刷新</button>
+          </div>
+        </div>
+      </header>
+
+      <main class="workspace">
+        <section class="panel students-panel" aria-labelledby="studentsTitle">
+          <div class="panel-head">
+            <div class="panel-title-group">
+              <h2 id="studentsTitle">学生列表</h2>
+              <span id="studentCount" class="count-badge">0</span>
+            </div>
+            <button id="deleteStudentButton" class="danger-ghost hidden" type="button">删除学生</button>
+          </div>
+          <div class="search-row">
+            <input id="studentSearchInput" autocomplete="off" placeholder="搜索学生姓名" />
+          </div>
+          <form id="studentForm" class="stack-form">
+            <input name="name" autocomplete="off" placeholder="学生姓名" required />
+            <input name="grade" autocomplete="off" placeholder="年级" />
+            <textarea name="notes" rows="2" placeholder="备注"></textarea>
+            <button type="submit">新增学生</button>
+          </form>
+          <div id="studentsList" class="list"></div>
+        </section>
+
+        <section class="panel lessons-panel" aria-labelledby="lessonsTitle">
+          <div class="panel-head">
+            <div class="panel-title-group">
+              <h2 id="lessonsTitle">课程列表</h2>
+              <span id="lessonCount" class="count-badge">0</span>
+            </div>
+            <span id="selectedStudentName" class="subtle"></span>
+          </div>
+          <div class="search-row">
+            <input id="lessonSearchInput" autocomplete="off" placeholder="搜索课程主题" />
+          </div>
+          <form id="lessonForm" class="stack-form disabled-zone">
+            <input name="lesson_title" autocomplete="off" placeholder="课程主题" required />
+            <input name="lesson_time" type="datetime-local" />
+            <button type="submit">新建课程</button>
+          </form>
+          <div id="lessonsList" class="list"></div>
+        </section>
+
+        <section class="panel detail-panel" aria-labelledby="detailTitle">
+          <div class="panel-head">
+            <h2 id="detailTitle">课堂处理</h2>
+            <span id="lessonStatusPill" class="status-pill">未选择</span>
+          </div>
+
+          <div id="emptyState" class="empty-state">
+            <p>先选择学生和课程</p>
+          </div>
+
+          <div id="lessonDetail" class="detail-body hidden">
+            <div class="lesson-summary">
+              <div class="lesson-summary-copy">
+                <span class="subtle">当前课程</span>
+                <h3 id="currentLessonTitle"></h3>
+              </div>
+              <button id="deleteLessonButton" class="danger-ghost" type="button">删除课程</button>
+            </div>
+
+            <div class="processing-layout">
+              <section class="surface upload-band">
+                <div class="section-head">
+                  <h3>上传录音</h3>
+                  <span class="subtle">支持 mp3 / wav / m4a / mp4 / webm / ogg</span>
+                </div>
+                <div class="privacy-note">
+                  请确认你已获得必要授权。本系统会将课堂录音用于转写和生成课后反馈。录音文件和转写文本仅用于课程总结，不会公开展示。
+                </div>
+                <div id="dropZone" class="drop-zone">
+                  <span>点击或拖拽录音到这里上传</span>
+                  <input id="audioInput" class="drop-zone-input" type="file" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg" aria-label="选择课堂录音文件" />
+                </div>
+                <div id="fileMeta" class="file-meta"></div>
+                <audio id="audioPreview" controls class="hidden"></audio>
+              </section>
+
+              <aside class="surface settings-surface">
+                <div class="settings-block">
+                  <span class="field-label">反馈生成方式</span>
+                  <select id="feedbackGeneratorSelect">
+                    <option value="local_llm">本地 LLM</option>
+                    <option value="openai_llm">OpenAI 兼容 LLM</option>
+                  </select>
+                </div>
+                <div class="settings-block">
+                  <span class="field-label">本地模型</span>
+                  <div class="model-controls">
+                    <select id="localModelSelect"></select>
+                    <button id="switchLocalModelButton" class="secondary-button" type="button">切换模型</button>
+                  </div>
+                  <p id="localModelHint" class="subtle model-hint"></p>
+                </div>
+                <div class="settings-block">
+                  <span class="field-label">家长反馈风格</span>
+                  <select id="styleSelect">
+                    <option value="professional_warm">专业温和</option>
+                    <option value="concise">简洁版</option>
+                    <option value="wechat">微信口吻</option>
+                  </select>
+                  <p class="field-hint">首次自动生成和重新生成都会使用这个风格</p>
+                </div>
+                <div class="upload-actions">
+                  <button id="uploadButton" type="button" disabled>上传并处理</button>
+                </div>
+              </aside>
+            </div>
+
+            <section class="surface progress-section">
+              <div class="progress-head">
+                <span id="progressText">等待上传</span>
+                <span id="chunkText" class="subtle"></span>
+              </div>
+              <div class="progress-track">
+                <div id="progressBar" class="progress-bar"></div>
+              </div>
+              <p id="errorMessage" class="error-text"></p>
+            </section>
+
+            <div class="analysis-grid">
+              <section class="surface chunk-surface">
+                <div class="section-head">
+                  <h3>分段状态</h3>
+                  <span class="subtle">处理进度</span>
+                </div>
+                <div id="chunkList" class="chunk-list"></div>
+              </section>
+
+              <section id="transcriptSection" class="surface transcript-surface hidden">
+                <div class="section-head">
+                  <h3>录音文字版</h3>
+                  <div class="inline-actions">
+                    <button id="copyTranscriptButton" type="button">复制文字版</button>
+                  </div>
+                </div>
+                <pre id="transcriptView" class="transcript-view"></pre>
+              </section>
+
+              <section id="feedbackSection" class="surface feedback-section hidden">
+                <div class="section-head">
+                  <h3>家长反馈</h3>
+                  <div class="inline-actions">
+                    <button id="regenerateButton" type="button">重新生成</button>
+                    <button id="copyButton" type="button">复制</button>
+                    <button id="saveFeedbackButton" type="button">保存</button>
+                  </div>
+                </div>
+                <textarea id="feedbackEditor" rows="12"></textarea>
+              </section>
+            </div>
+
+            <section class="surface summary-section">
+              <div class="section-head compact">
+                <h3>结构化总结</h3>
+                <span class="subtle">自动提炼</span>
+              </div>
+              <div id="summaryCards" class="summary-cards"></div>
+              <details class="raw-summary">
+                <summary>查看原始结构</summary>
+                <pre id="summaryView" class="json-view"></pre>
+              </details>
+            </section>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="loginOverlay" class="login-overlay hidden">
+      <form id="loginForm" class="login-box">
+        <h2>登录</h2>
+        <input name="username" type="text" value="teacher" autocomplete="username" hidden />
+        <input name="access_token" type="password" placeholder="访问口令" autocomplete="current-password" required />
+        <button type="submit">进入工作台</button>
+      </form>
+    </div>
+
+    <div id="toast" class="toast hidden"></div>
+    <script src="/app.js"></script>
+  </body>
+</html>
