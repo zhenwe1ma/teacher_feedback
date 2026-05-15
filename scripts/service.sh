@@ -85,11 +85,57 @@ wait_for_port() {
 }
 
 display_host() {
-  if [[ "$HOST" == "0.0.0.0" ]]; then
+  if [[ "$HOST" == "0.0.0.0" || "$HOST" == "::" ]]; then
     printf "127.0.0.1"
     return
   fi
   printf "%s" "$HOST"
+}
+
+is_private_ipv4() {
+  local address="$1"
+  [[ "$address" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+  local a b c d
+  IFS=. read -r a b c d <<< "$address"
+  [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ && "$c" =~ ^[0-9]+$ && "$d" =~ ^[0-9]+$ ]] || return 1
+  ((a == 10)) || ((a == 172 && b >= 16 && b <= 31)) || ((a == 192 && b == 168))
+}
+
+collect_lan_hosts() {
+  local values=()
+  if command -v hostname >/dev/null 2>&1; then
+    local host
+    for host in $(hostname -I 2>/dev/null || true); do
+      if is_private_ipv4 "$host"; then
+        values+=("$host")
+      fi
+    done
+  fi
+  if command -v ip >/dev/null 2>&1; then
+    local line address
+    while IFS= read -r line; do
+      address="${line#* inet }"
+      address="${address%%/*}"
+      if is_private_ipv4 "$address"; then
+        values+=("$address")
+      fi
+    done < <(ip -o -4 addr show scope global 2>/dev/null || true)
+  fi
+  printf "%s\n" "${values[@]}" | awk 'NF && !seen[$0]++'
+}
+
+print_access_urls() {
+  echo "可访问地址："
+  echo "  本机: http://$(display_host):$PORT"
+  if [[ "$HOST" == "0.0.0.0" || "$HOST" == "::" ]]; then
+    local lan_host
+    while IFS= read -r lan_host; do
+      [[ -n "$lan_host" ]] || continue
+      echo "  局域网: http://$lan_host:$PORT"
+    done < <(collect_lan_hosts)
+  elif is_private_ipv4 "$HOST"; then
+    echo "  局域网: http://$HOST:$PORT"
+  fi
 }
 
 extract_host_port() {
@@ -140,8 +186,8 @@ start_ollama_if_needed() {
 
   local ollama_bin="$ROOT_DIR/.local/ollama/bin/ollama"
   if [[ ! -x "$ollama_bin" ]]; then
-    echo "未找到 $ollama_bin，无法自动启动本地 LLM。"
-    exit 1
+    echo "未找到 $ollama_bin，跳过本地 LLM 启动，仅启动 Web 服务。"
+    return 0
   fi
 
   mkdir -p "$RUN_DIR" "$LOG_DIR"
@@ -151,9 +197,9 @@ start_ollama_if_needed() {
 
   if ! wait_for_port "$llm_port" 15; then
     rm -f "$OLLAMA_PID_FILE"
-    echo "本地 LLM 启动失败，请查看日志：$OLLAMA_LOG_FILE"
+    echo "本地 LLM 启动失败，继续启动 Web 服务。日志：$OLLAMA_LOG_FILE"
     tail -n 40 "$OLLAMA_LOG_FILE" || true
-    exit 1
+    return 0
   fi
   echo "本地 LLM 已启动。PID=$pid 日志=$OLLAMA_LOG_FILE"
 }
@@ -163,7 +209,8 @@ start_web() {
   local existing_pid
   existing_pid="$(read_pid "$WEB_PID_FILE")"
   if [[ -n "$existing_pid" ]] && is_pid_running "$existing_pid"; then
-    echo "Web 服务已在运行。PID=$existing_pid 地址=http://$(display_host):$PORT"
+    echo "Web 服务已在运行。PID=$existing_pid"
+    print_access_urls
     return
   fi
 
@@ -171,6 +218,7 @@ start_web() {
   listener_pid="$(listener_pid_by_port "$PORT")"
   if [[ -n "$listener_pid" ]]; then
     echo "端口 $PORT 已被其他进程占用。PID=$listener_pid"
+    print_access_urls
     exit 1
   fi
 
@@ -188,7 +236,8 @@ start_web() {
     tail -n 60 "$WEB_LOG_FILE" || true
     exit 1
   fi
-  echo "Web 服务已启动。PID=$pid 地址=http://$(display_host):$PORT"
+  echo "Web 服务已启动。PID=$pid"
+  print_access_urls
   echo "日志路径：$WEB_LOG_FILE"
 }
 
@@ -274,7 +323,8 @@ usage() {
 
 说明：
   - start 会按当前 .env 启动 Web 服务
-  - 当配置命中本机 Ollama 时，也会一并启动本地 LLM
+  - 当配置命中本机 Ollama 时，会尝试一并启动本地 LLM
+  - 如果本地 LLM 不存在或启动失败，Web 服务仍会继续启动
   - stop 只会关闭当前脚本启动并托管的进程
 EOF
 }

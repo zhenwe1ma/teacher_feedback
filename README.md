@@ -31,7 +31,9 @@ bash scripts/service.sh stop
 说明：
 
 - `start` 会按当前 `.env` 启动 Web 服务
-- 当配置命中本机 Ollama 时，也会一并启动本地 LLM
+- 当配置命中本机 Ollama 时，会尝试一并启动本地 LLM
+- 如果本地 LLM 不存在或启动失败，Web 服务仍会继续启动
+- 启动成功或端口已有服务时，会打印本机地址和所有可共享的局域网地址
 - `stop` 只会关闭当前脚本托管的进程，不会误杀你自己另外起的服务
 - 日志和 PID 文件保存在 `.run/`
 
@@ -83,6 +85,9 @@ AI_PROVIDER=local
 ALLOW_EXTERNAL_API_COST=0
 LOCAL_WHISPER_MODEL=medium
 LOCAL_WHISPER_LANGUAGE=zh
+LOCAL_WHISPER_BATCH_ENABLED=1
+LOCAL_WHISPER_BEAM_SIZE=5
+LOCAL_WHISPER_BEST_OF=5
 DEFAULT_FEEDBACK_GENERATOR=local_llm
 LOCAL_LLM_BASE_URL=http://127.0.0.1:11434/v1
 LOCAL_LLM_MODEL=qwen3.5:4b
@@ -91,9 +96,23 @@ HOST=0.0.0.0
 
 这个模式会调用 `scripts/transcribe_local.py` 和 `faster-whisper` 完成本地中文转写；反馈生成默认走本机 Ollama 的 OpenAI 兼容接口，默认模型是 `qwen3.5:4b`。这台 `RTX 3050 Ti 4GB` 机器不把 `Qwen3.5-9B` 作为默认值；如果你后续自己拉好了 9B，它会出现在页面“本地模型”下拉框里，可以手动切换。
 
+语音转文字速度优化不通过降低识别精度实现：默认仍使用 `beam_size=5` 和 `best_of=5`。当一条录音被切成多段时，后端会用批量转写模式让多个切片复用同一次 `medium` 模型加载，减少重复初始化开销。
+
 当前后端会对本地 Qwen thinking 模型显式关闭 reasoning，并在结构化总结请求上启用 JSON mode，避免模型把 token 全耗在思考过程里，导致没有最终 JSON 输出。
 
-针对长录音，当前总结链路会先做分段摘要，再汇总成整节课总结，尽量避免本地小模型只抓住最后一道题，导致家长反馈只覆盖课堂尾段内容。
+针对长录音，当前总结链路会先做分段摘要，再汇总成整节课总结；同时会先从 transcript 中提取题号和知识点提示，作为覆盖约束喂给本地 LLM，尽量避免本地小模型只抓住最后一道题，导致家长反馈只覆盖课堂尾段内容。汇总结果里还会显式产出 `feedback_required_mentions`，把“前半段必须提哪些知识点、后半段必须提哪些知识点、哪些共性问题必须进反馈”固定下来。
+
+针对长录音的稳定性，当前还有两层额外保护：
+
+- `merge summary` 已改成服务端确定性合并，不再要求本地 4B 模型在最后一步吐出一个超大的最终 JSON
+- 本地 LLM 的聊天补全改成显式超时控制的原生 HTTP 请求，并把长 transcript 的默认分块收紧到 `SUMMARY_GROUP_SECTION_COUNT=2`
+
+如果这台机器后续更快，或者你想自己权衡质量和耗时，可以在 `.env` 里继续调整：
+
+```text
+LOCAL_LLM_REQUEST_TIMEOUT_MS=900000
+SUMMARY_GROUP_SECTION_COUNT=2
+```
 
 页面里可以单独选择“反馈生成方式”：
 
@@ -114,6 +133,11 @@ HOST=0.0.0.0
   - 开头问候 + “今天这节课主要包括”
   - `掌握得较好的部分`
   - `还需要加强的部分` + 课后建议
+- 当前提示词已经按老师常用的“课后反馈”口吻收紧：
+  - 先概括本节课主线，再列 `主要内容包括`
+  - 亮点和问题都写成自然段，不写成课堂流水账
+  - 课后建议和下节课重点收在最后一段，不再单独起“改进策略”清单
+- 当前结构化总结里还会额外保留 `question_breakdown` 和 `feedback_required_mentions`，用来显式覆盖不同题号或不同知识模块，减少前半段内容被漏掉的情况
 
 ## ffmpeg
 

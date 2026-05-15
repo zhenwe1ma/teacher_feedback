@@ -15,6 +15,8 @@
 - 默认本地转写模型已切到 `medium`
 - 本机 `ffmpeg` / `ffprobe` 已安装
 - 本地转写脚本 `scripts/transcribe_local.py` 已接入
+- 本地转写默认仍保持 `beam_size=5` / `best_of=5`，不通过降低精度换速度
+- 多切片录音启用批量转写模式，复用同一次 Whisper 模型加载来提速
 
 ### 3. 反馈生成路线收口
 
@@ -93,7 +95,9 @@
   - `restart`
   - `status`
 - `start` 会按当前 `.env` 启动 Web 服务
-- 当配置命中项目内 Ollama 时，会自动复用或启动本地 LLM
+- 当配置命中项目内 Ollama 时，会自动复用或尝试启动本地 LLM
+- 如果本地 LLM 不存在或启动失败，脚本会继续启动 Web 服务
+- 启动成功或端口已有服务时，会打印本机地址和所有可共享的局域网地址
 - `stop` 只会关闭脚本自己托管的进程
 - 新增 npm 命令：
   - `npm run service:start`
@@ -109,14 +113,18 @@
   - 优先使用 Clipboard API
   - 失败时自动回退到 `document.execCommand("copy")`
 - 这样在 `http://127.0.0.1` 之外的局域网 HTTP 地址下，复制按钮也更稳定
+- 学生列表已新增“复制”按钮，可单独复制学生姓名，不影响点击学生切换课程列表
 
 ### 12. 长录音总结偏到最后一道题的问题已开始修复
 
 - `server.js` 的结构化总结链路已改成：
   - 长 transcript 先做分段摘要
   - 再把分段摘要汇总成整节课总结
+- transcript 现在会先提取题号 / 知识点覆盖提示，并把这些提示注入 block summary、merge summary 和最终反馈 prompt
 - 新 summary schema 在兼容原字段的基础上，新增：
   - `covered_topics`
+  - `question_breakdown`
+  - `feedback_required_mentions`
   - `lesson_segments`
   - `recurring_weaknesses`
   - `coverage_check`
@@ -126,6 +134,19 @@
   - `今天这节课主要包括`
   - `掌握得较好的部分`
   - `还需要加强的部分`
+- 反馈风格的长度约束已进一步放宽到更适合多题型课堂，避免模型为了压字数继续丢掉前半段内容
+
+### 13. 长录音本地 LLM 稳定性问题继续收口
+
+- 已确认旧失败点之一是：本地小模型在 `merge summary` 阶段不稳定返回大 JSON，导致 `模型没有返回合法 JSON`
+- 当前已改成：
+  - block summary 仍走 LLM
+  - merge summary 改成服务端确定性合并，不再要求本地 4B 模型吐一个超大最终 JSON
+- 已确认新的瓶颈之一是：本地 LLM 非流式 `/chat/completions` 请求会撞上默认超时
+- 当前已改成：
+  - 聊天补全改用显式超时控制的原生 HTTP 请求
+  - 新增 `LOCAL_LLM_REQUEST_TIMEOUT_MS`
+  - 长 transcript 的默认分块从 `5` 段收紧到 `2` 段，降低单个 block prompt 的体积
 
 ## 当前验证结果
 
@@ -134,6 +155,32 @@
 - `node --check server.js` 通过
 - `node --check public/app.js` 通过
 - `npm run check` 已重新通过，输出 `smoke test passed`
+- 本轮超时修复后再次回跑：
+  - `node --check server.js` 通过
+  - `npm run check` 通过，输出 `smoke test passed`
+
+### 14. 家长反馈提示词已按老师模板口吻收紧
+
+- 已参考老师常用的“课后反馈”模板调整 `feedbackWithLlm()` 提示词
+- 当前正文结构明确收口为：
+  - 开头问候 + 本节课总述
+  - `主要内容包括`
+  - `掌握得较好的部分`
+  - `还需要加强的部分`
+- 已明确要求：
+  - 先概括本节课内容，再写亮点和问题
+  - 亮点与问题都写成自然段，不写成课堂逐题复述
+  - 课后建议和下节课重点自然收在最后一段
+  - 避免输出“针对这些问题，我制定了以下改进策略”这类报告腔
+
+### 15. 学生姓名复制与转写提速
+
+- 学生列表每个学生项右侧新增“复制”按钮
+- 复制学生姓名复用现有 `copyText()`，在局域网 HTTP 下仍有回退逻辑
+- 本地转写新增批量模式：
+  - 多个切片由同一个 Python 进程连续转写
+  - `faster-whisper medium` 模型只加载一次
+  - 默认识别参数不降级，仍为 `beam_size=5` / `best_of=5`
 
 ### 当前运行实例
 

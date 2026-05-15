@@ -189,23 +189,26 @@ function renderStudents() {
     return;
   }
   for (const student of filtered) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `list-item ${student.id === state.selectedStudentId ? "active" : ""}`;
-    button.innerHTML = `
-      <div class="list-card">
-        <span class="avatar-chip">${escapeHtml(getAvatarText(student.name))}</span>
-        <div class="list-card-main">
-          <div class="item-row">
-            <strong>${escapeHtml(student.name)}</strong>
-            <span class="subtle">${escapeHtml(student.grade || "")}</span>
+    const item = document.createElement("div");
+    item.className = `list-item student-list-item ${student.id === state.selectedStudentId ? "active" : ""}`;
+    item.innerHTML = `
+      <button class="student-select-button" type="button">
+        <div class="list-card">
+          <span class="avatar-chip">${escapeHtml(getAvatarText(student.name))}</span>
+          <div class="list-card-main">
+            <div class="item-row">
+              <strong>${escapeHtml(student.name)}</strong>
+              <span class="subtle">${escapeHtml(student.grade || "")}</span>
+            </div>
+            <span class="subtle">${escapeHtml(student.notes || "无备注")}</span>
           </div>
-          <span class="subtle">${escapeHtml(student.notes || "无备注")}</span>
         </div>
-      </div>
+      </button>
+      <button class="student-copy-button" type="button" title="复制姓名" aria-label="复制${escapeHtml(student.name)}的姓名">复制</button>
     `;
-    button.addEventListener("click", () => selectStudent(student.id));
-    el.studentsList.append(button);
+    item.querySelector(".student-select-button").addEventListener("click", () => selectStudent(student.id));
+    item.querySelector(".student-copy-button").addEventListener("click", () => onCopyStudentName(student.name));
+    el.studentsList.append(item);
   }
 }
 
@@ -753,6 +756,20 @@ async function onCopyTranscript() {
   try {
     const copied = await copyText(text);
     toast(copied ? "文字版已复制" : "复制失败，请手动 Ctrl+C");
+  } catch (error) {
+    toast(error.message || "复制失败，请手动 Ctrl+C");
+  }
+}
+
+async function onCopyStudentName(name) {
+  const text = String(name || "").trim();
+  if (!text) {
+    toast("没有可复制的学生姓名");
+    return;
+  }
+  try {
+    const copied = await copyText(text);
+    toast(copied ? "学生姓名已复制" : "复制失败，请手动 Ctrl+C");
   } catch (error) {
     toast(error.message || "复制失败，请手动 Ctrl+C");
   }

@@ -1,6 +1,7 @@
 "use strict";
 
 const http = require("http");
+const https = require("https");
 const os = require("os");
 const fs = require("fs");
 const fsp = require("fs/promises");
@@ -34,6 +35,9 @@ const APP_ACCESS_TOKEN = process.env.APP_ACCESS_TOKEN || "";
 const LOCAL_TRANSCRIBE_PYTHON = process.env.LOCAL_TRANSCRIBE_PYTHON || "python3";
 const LOCAL_WHISPER_MODEL = process.env.LOCAL_WHISPER_MODEL || "medium";
 const LOCAL_WHISPER_LANGUAGE = process.env.LOCAL_WHISPER_LANGUAGE || "zh";
+const LOCAL_WHISPER_BATCH_ENABLED = process.env.LOCAL_WHISPER_BATCH_ENABLED === undefined
+  ? true
+  : parseBoolean(process.env.LOCAL_WHISPER_BATCH_ENABLED);
 const LOCAL_TRANSCRIBE_SCRIPT = path.join(ROOT_DIR, "scripts", "transcribe_local.py");
 const LOCAL_DEP_MARKER = path.join(ROOT_DIR, ".pydeps", "faster_whisper");
 const LOCAL_LLM_BASE_URL = (process.env.LOCAL_LLM_BASE_URL || "").replace(/\/$/, "");
@@ -41,9 +45,45 @@ const LOCAL_LLM_API_KEY = process.env.LOCAL_LLM_API_KEY || "";
 const LOCAL_LLM_MODEL = process.env.LOCAL_LLM_MODEL || "";
 const DEFAULT_FEEDBACK_GENERATOR = cleanString(process.env.DEFAULT_FEEDBACK_GENERATOR || "local_llm").toLowerCase();
 const DEFAULT_FEEDBACK_STYLE = "professional_warm";
-const SUMMARY_GROUP_SECTION_COUNT = 5;
+const SUMMARY_GROUP_SECTION_COUNT = Math.max(1, Number(process.env.SUMMARY_GROUP_SECTION_COUNT || 2));
 const SUMMARY_HIERARCHY_SECTION_THRESHOLD = 6;
 const SUMMARY_HIERARCHY_TEXT_THRESHOLD = 12000;
+const LOCAL_LLM_REQUEST_TIMEOUT_MS = Math.max(60_000, Number(process.env.LOCAL_LLM_REQUEST_TIMEOUT_MS || 900_000));
+const OPENAI_CHAT_REQUEST_TIMEOUT_MS = Math.max(30_000, Number(process.env.OPENAI_CHAT_REQUEST_TIMEOUT_MS || 180_000));
+const TOPIC_HINT_RULES = [
+  {
+    label: "分段函数零点与函数图像",
+    keywords: ["分段函数", "零点", "图像", "指数函数", "对勾", "飘带", "函数图像", "交点问题"],
+  },
+  {
+    label: "经验回归方程与样本相关系数",
+    keywords: ["回归方程", "经验回归方程", "样本相关系数", "小r", "大r", "斜率", "截距", "平均值"],
+  },
+  {
+    label: "外心重心垂心、欧拉线与直线和圆",
+    keywords: ["外心", "重心", "垂心", "欧拉线", "中垂线", "中线", "高线", "圆心", "切线长", "弦长", "纯金定理"],
+  },
+  {
+    label: "奇偶函数与定义域对称",
+    keywords: ["奇函数", "偶函数", "定义域", "对称", "绝对值", "x不等于m"],
+  },
+  {
+    label: "古典概型与排列组合",
+    keywords: ["古典概型", "概率", "有放回", "取球", "排列", "组合", "不同整数", "分母", "分子"],
+  },
+  {
+    label: "立体几何中的平行证明与面积条件",
+    keywords: ["立体几何", "平行", "菱形", "面积", "底高", "正弦", "体积", "棱锥", "柱体", "相似"],
+  },
+  {
+    label: "空间向量建系、线面角与最值",
+    keywords: ["空间向量", "建系", "坐标", "动点", "线面角", "数量积", "最值", "二次函数", "lambda", "向量"],
+  },
+  {
+    label: "三角函数与解三角形",
+    keywords: ["三角函数", "解三角形", "sin", "cos", "tan"],
+  },
+];
 
 let db = null;
 const activeJobs = new Set();
@@ -551,14 +591,16 @@ async function processUploadedAudio(recordingId) {
       .filter((chunk) => chunk.recording_id === recording.id)
       .sort((a, b) => a.chunk_index - b.chunk_index);
 
-    for (const chunk of chunks) {
-      if (chunk.transcription_status === "completed") {
-        continue;
-      }
-      try {
-        await processChunkWithRetry(chunk.id, false);
-      } catch (error) {
-        console.warn(`切片 ${chunk.id} 转写失败: ${error.message}`);
+    const pendingChunks = chunks.filter((chunk) => chunk.transcription_status !== "completed");
+    if (getEffectiveAiMode() === "local" && LOCAL_WHISPER_BATCH_ENABLED && pendingChunks.length > 1) {
+      await processLocalChunksInBatch(pendingChunks);
+    } else {
+      for (const chunk of pendingChunks) {
+        try {
+          await processChunkWithRetry(chunk.id, false);
+        } catch (error) {
+          console.warn(`切片 ${chunk.id} 转写失败: ${error.message}`);
+        }
       }
     }
 
@@ -779,6 +821,51 @@ async function processChunkWithRetry(chunkId, manualRetry) {
   throw lastError || new Error("切片转写失败");
 }
 
+async function processLocalChunksInBatch(chunks) {
+  let pending = chunks.filter((chunk) => chunk.transcription_status !== "completed" && chunk.retry_count < MAX_AUTO_RETRIES);
+  while (pending.length > 0) {
+    for (const chunk of pending) {
+      chunk.transcription_status = "transcribing";
+      chunk.error_message = "";
+      chunk.updated_at = nowIso();
+    }
+    await saveDb();
+
+    let results = [];
+    let batchError = null;
+    try {
+      const output = await runCommand(LOCAL_TRANSCRIBE_PYTHON, [
+        LOCAL_TRANSCRIBE_SCRIPT,
+        "--batch",
+        LOCAL_WHISPER_MODEL,
+        LOCAL_WHISPER_LANGUAGE,
+        ...pending.map((chunk) => chunk.chunk_audio_path),
+      ]);
+      results = JSON.parse(output.stdout || "{}").results || [];
+    } catch (error) {
+      batchError = error;
+    }
+
+    const resultByPath = new Map(results.map((result) => [result.path, result]));
+    for (const chunk of pending) {
+      const result = resultByPath.get(chunk.chunk_audio_path);
+      if (!batchError && result && !result.error) {
+        chunk.transcript_text = cleanString(result.text);
+        chunk.transcription_status = "completed";
+        chunk.error_message = "";
+      } else {
+        chunk.retry_count += 1;
+        chunk.transcription_status = "failed";
+        chunk.error_message = batchError?.message || result?.error || "转写失败";
+      }
+      chunk.updated_at = nowIso();
+    }
+    await saveDb();
+
+    pending = chunks.filter((chunk) => chunk.transcription_status !== "completed" && chunk.retry_count < MAX_AUTO_RETRIES);
+  }
+}
+
 async function transcribeChunk(chunkId) {
   const chunk = db.chunks.find((item) => item.id === chunkId);
   if (!chunk) {
@@ -947,6 +1034,7 @@ async function summarizeAndGenerate(lessonId, options = {}) {
 
 async function summarizeWithLlm(transcript, generator) {
   const sections = splitTranscriptSections(transcript);
+  const globalHints = buildTranscriptCoverageHints(transcript, sections);
   if (shouldUseHierarchicalSummary(sections, transcript)) {
     const groups = groupItems(sections, SUMMARY_GROUP_SECTION_COUNT);
     const partials = [];
@@ -958,19 +1046,19 @@ async function summarizeWithLlm(transcript, generator) {
         summary: partial,
       });
     }
-    return mergePartialSummariesWithLlm(partials, generator);
+    return mergePartialSummariesWithLlm(partials, generator, globalHints);
   }
-  return summarizeWholeTranscriptWithLlm(transcript, generator);
+  return summarizeWholeTranscriptWithLlm(transcript, generator, globalHints);
 }
 
-async function summarizeWholeTranscriptWithLlm(transcript, generator) {
+async function summarizeWholeTranscriptWithLlm(transcript, generator, globalHints = null) {
   const content = [
     "你是一名经验丰富的高中数学老师，正在整理一整节数学课的结构化总结。",
     "目标：覆盖整节课，不要只盯最后一道题。",
     "要求：",
     "1. 只基于转写稿内容，不要编造。",
     "2. lesson_content 必须概括整节课主线，如果课堂覆盖多个题号或多个知识点，不能只写最后一个题。",
-    "3. covered_topics 至少列出 4 个不同知识点或题型；如果课堂实际不足 4 个，再如实少写。",
+    "3. covered_topics 至少列出 6 个不同知识点或题型；如果课堂实际不足 6 个，再如实少写。",
     "4. lesson_segments 必须按时间顺序覆盖前半段、中段、后半段；中段如果主要是闲聊或过渡，可以明确写“少量闲聊/非核心教学内容”。",
     "5. 忽略寒暄、吃东西、录音测试、约时间等非教学内容，不要让这些内容进入 lesson_content、strengths、weaknesses。",
     "6. weaknesses 优先总结跨多道题反复出现的共性问题，不要只写最后一道题的局部问题。",
@@ -978,8 +1066,15 @@ async function summarizeWholeTranscriptWithLlm(transcript, generator) {
     "8. student_performance 重点写整节课的课堂状态、理解速度、表达、图像、计算、方法切换等整体表现。",
     "9. correction_suggestions、homework_suggestion、next_lesson_focus 要对应今天课堂里真正暴露出的共性问题。",
     "10. coverage_check 里的 covered_early、covered_middle、covered_late、not_last_problem_only 必须如实填写。",
-    "11. 如果某些字段在转写稿中没有明确提及，请写“未明确提及”或留空数组。",
-    "12. 只输出合法 JSON，不要额外解释。",
+    "11. question_breakdown 至少写 4 条、至多写 8 条，优先覆盖不同题号或不同知识模块；每条都要写清 problem_ref、topic、teacher_focus、student_issue。",
+    "12. feedback_required_mentions.early_topics 至少保留 3 个前半段知识点，late_topics 至少保留 2 个后半段知识点；如果课堂实际不足，再如实少写。",
+    "13. feedback_required_mentions.recurring_issues 优先写整节课反复出现的共性问题；avoid_single_focus 固定写明不能只围绕最后一道题展开。",
+    "14. 如果系统提示里已经识别到题号或知识点，且它们确实来自转写稿，最终总结应尽量覆盖，不要大面积遗漏前半段内容。",
+    "15. 如果某些字段在转写稿中没有明确提及，请写“未明确提及”或留空数组。",
+    "16. 只输出合法 JSON，不要额外解释。",
+    "",
+    "系统从转写稿提取到的覆盖提示：",
+    formatCoverageHints(globalHints),
     "",
     "课堂转写稿：",
     transcript,
@@ -993,23 +1088,37 @@ async function summarizeWholeTranscriptWithLlm(transcript, generator) {
     { role: "user", content },
   ], {
     responseFormat: { type: "json_object" },
-    maxTokens: 1800,
+    maxTokens: 2200,
   });
-  return normalizeStructuredSummary(parseJsonObject(text));
+  try {
+    return normalizeStructuredSummary(parseJsonObject(text));
+  } catch (error) {
+    console.error("[DEBUG-json-merge]", JSON.stringify({
+      textLength: String(text || "").length,
+      preview: String(text || "").slice(0, 4000),
+    }));
+    throw error;
+  }
 }
 
 async function summarizeTranscriptBlockWithLlm(group, blockIndex, totalBlocks, generator) {
   const blockTranscript = group
     .map((section) => `${section.label}\n${section.body}`)
     .join("\n\n");
+  const blockHints = buildBlockCoverageHints(group);
   const content = [
     `你正在为一整节课做分段摘要。当前只总结第 ${blockIndex}/${totalBlocks} 个时间块，不要总结其他未提供的部分。`,
     "要求：",
     "1. 只基于当前时间块内容，不要脑补整节课。",
     "2. 如果当前时间块主要是闲聊、寒暄、吃东西、录音测试、约时间等非教学内容，teaching_relevance 写 low，并把 covered_topics 留空。",
     "3. 如果当前时间块有教学内容，提取这一段涉及的题号/知识点、学生表现、亮点、问题、典型例子和建议。",
-    "4. 问题优先写这一段里反复出现或被老师明确指出的问题。",
-    "5. 只输出合法 JSON，不要额外解释。",
+    "4. covered_topics 如果有教学内容，尽量写满 2-4 条不同知识点；question_breakdown 尽量写 2-4 条不同题号或不同模块。",
+    "5. 问题优先写这一段里反复出现或被老师明确指出的问题。",
+    "6. 如果系统提示里识别到了题号或知识点，且它们确实来自当前时间块，请尽量覆盖，不要只保留最后一句话。",
+    "7. 只输出合法 JSON，不要额外解释。",
+    "",
+    "当前时间块覆盖提示：",
+    formatCoverageHints(blockHints),
     "",
     "当前时间块转写稿：",
     blockTranscript,
@@ -1022,37 +1131,14 @@ async function summarizeTranscriptBlockWithLlm(group, blockIndex, totalBlocks, g
     { role: "user", content },
   ], {
     responseFormat: { type: "json_object" },
-    maxTokens: 900,
+    maxTokens: 1200,
   });
   return normalizeTranscriptBlockSummary(parseJsonObject(text));
 }
 
-async function mergePartialSummariesWithLlm(partials, generator) {
-  const content = [
-    "你将收到同一节数学课不同时间块的分段摘要，请整合成一份覆盖整节课的结构化总结。",
-    "要求：",
-    "1. 必须综合所有有教学内容的时间块，不能只抓最后一个时间块。",
-    "2. lesson_content 要概括整节课主线；covered_topics 需要覆盖前半段和后半段的主要知识点。",
-    "3. lesson_segments 必须按时间顺序写前半段、中段、后半段；如果某一段主要是闲聊，可以简短说明。",
-    "4. strengths 和 weaknesses 优先总结整节课里反复出现的共性表现，不要只写单题现象。",
-    "5. typical_examples 至少来自两个不同时间块，最后一道题最多占一条。",
-    "6. coverage_check 里的 covered_early、covered_middle、covered_late、not_last_problem_only 必须如实填写。",
-    "7. 只输出合法 JSON，不要额外解释。",
-    "",
-    "分段摘要：",
-    JSON.stringify(partials, null, 2),
-    "",
-    "请按如下 JSON 格式输出：",
-    JSON.stringify(structuredSummaryTemplate(), null, 2),
-  ].join("\n");
-  const text = await chatWithFeedbackGenerator(generator, [
-    { role: "developer", content: "你只输出合法 JSON。" },
-    { role: "user", content },
-  ], {
-    responseFormat: { type: "json_object" },
-    maxTokens: 1800,
-  });
-  return normalizeStructuredSummary(parseJsonObject(text));
+async function mergePartialSummariesWithLlm(partials, generator, globalHints = null) {
+  void generator;
+  return mergePartialSummariesDeterministically(partials, globalHints);
 }
 
 async function feedbackWithLlm(summary, options = {}, generator) {
@@ -1067,14 +1153,23 @@ async function feedbackWithLlm(summary, options = {}, generator) {
     `4. ${styleSpec.lengthRule}`,
     "5. 不要出现“根据转写稿”“AI”“模型”等字样。",
     "6. 不要编造课堂中没有出现的内容。",
-    "7. 必须优先使用 covered_topics、lesson_segments、recurring_weaknesses 去覆盖整节课，不能只围绕最后一道题展开。",
-    "8. 开头先向家长问好，再写“今天这节课我主要带孩子对……进行了梳理和练习。主要包括：”。",
-    "9. “主要包括”后面用 3-4 条精炼条目概括整节课涉及的核心知识模块，可以合并表达，不要逐题流水账。",
-    "10. 后面用“掌握得较好的部分：”和“还需要加强的部分：”两个部分来写，结构参考老师平时发给家长的课后反馈。",
-    "11. 问题部分优先写整节课反复出现的共性问题，例如图像不准、概念记忆不牢、方法切换不灵活、计算表达不稳等。",
-    "12. 课后建议和下节课重点可以合并到结尾 1-2 句里，保持简洁，不要冗长。",
-    `13. 风格代号：${style}；风格名称：${styleSpec.label}；长度：${options.length || "medium"}。`,
-    "14. 风格细则：",
+    "7. 必须优先使用 feedback_required_mentions、covered_topics、lesson_segments、question_breakdown、recurring_weaknesses 去覆盖整节课，不能只围绕最后一道题展开。",
+    "8. 输出结构固定参考老师日常“课后反馈”口吻：",
+    "   - 第一部分：先向家长问好，再用一句话概括本节课主线，然后写“主要内容包括：”",
+    "   - 第二部分：写“掌握得较好的部分：”",
+    "   - 第三部分：写“还需要加强的部分：”",
+    "9. 如果课堂明显是在订正一张卷子或集中梳理多道题，第一部分必须明确写出“围绕试卷中的疑问题进行订正和梳理”这类意思，不要误写成只讲一个专题。",
+    "10. “主要内容包括”后面写 4-6 条编号内容，每条概括一个知识模块、题型或方法，不按题号顺序复述课堂过程，不要写成逐题流水账。",
+    "11. 这 4-6 条里，至少 2 条来自前半段或中段内容，至少 1 条来自后半段内容；如果中段主要是过渡，则以前半段和后半段覆盖为主。",
+    "12. 如果 feedback_required_mentions.early_topics 非空，正文里至少要覆盖其中 3 个前半段知识点；如果 late_topics 非空，正文里至少要覆盖其中 2 个后半段知识点。",
+    "13. “掌握得较好的部分”写成一个自然段，至少 2 句，先写孩子当前掌握得较好的内容、思路方向、跟随度或在提示后能修正的地方，再写本节课的具体进步或收获。",
+    "14. “还需要加强的部分”也写成一个自然段，至少 2 句，先点出 1-3 个整节课反复出现的共性问题，再自然带出课后复盘建议、下节课抽查重点或后续训练方向。",
+    "15. 问题部分优先写整节课反复出现的共性问题，例如图像不准、概念记忆不牢、方法切换不灵活、计算表达不稳等，而不是只写最后一道题；措辞尽量使用“还不够熟练”“有些疑惑”“没有马上想起来”“需要再体会一下”这类老师口吻。",
+    "16. 避免使用“针对这些问题，我制定了以下改进策略：”“总体表现良好但……”这类报告腔模板；课后建议和下节课重点要自然地融入“还需要加强的部分”结尾，不要单独再起一段。",
+    "17. 如果 structured_summary 里已有多题型覆盖，正文必须体现这种广度，不要把“主要内容包括”缩成 2 个专题。",
+    "18. 除“主要内容包括”的编号外，其余部分不要再堆砌条目、子标题或步骤清单。",
+    `19. 风格代号：${style}；风格名称：${styleSpec.label}；长度：${options.length || "medium"}。`,
+    "20. 风格细则：",
     ...styleSpec.instructions.map((item, index) => `${index + 1}. ${item}`),
     "",
     "课堂结构化信息：",
@@ -1104,6 +1199,7 @@ async function chatWithOpenAi(messages, options = {}) {
     messages,
     responseFormat: options.responseFormat,
     maxTokens: options.maxTokens,
+    timeoutMs: options.timeoutMs || OPENAI_CHAT_REQUEST_TIMEOUT_MS,
   });
 }
 
@@ -1120,13 +1216,14 @@ async function chatWithLocalLlm(messages, options = {}) {
     messages,
     responseFormat: options.responseFormat,
     maxTokens: options.maxTokens,
+    timeoutMs: options.timeoutMs || LOCAL_LLM_REQUEST_TIMEOUT_MS,
     extraBody: {
       reasoning_effort: "none",
     },
   });
 }
 
-async function chatWithOpenAiCompatible({ baseUrl, apiKey, model, label, messages, responseFormat, maxTokens, extraBody = null }) {
+async function chatWithOpenAiCompatible({ baseUrl, apiKey, model, label, messages, responseFormat, maxTokens, timeoutMs, extraBody = null }) {
   const headers = {
     "Content-Type": "application/json",
   };
@@ -1146,16 +1243,12 @@ async function chatWithOpenAiCompatible({ baseUrl, apiKey, model, label, message
   if (extraBody && typeof extraBody === "object") {
     Object.assign(body, extraBody);
   }
-  const response = await fetch(`${baseUrl}/chat/completions`, {
-    method: "POST",
+  const result = await postJsonWithTimeout(`${baseUrl}/chat/completions`, {
     headers,
-    body: JSON.stringify(body),
+    body,
+    timeoutMs,
+    label,
   });
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`${label} 文本生成失败: ${response.status} ${errorText.slice(0, 500)}`);
-  }
-  const result = await response.json();
   const choice = result.choices?.[0] || {};
   const content = sanitizeModelText(choice.message?.content);
   if (content) {
@@ -1166,6 +1259,52 @@ async function chatWithOpenAiCompatible({ baseUrl, apiKey, model, label, message
     throw new Error(`${label} 只返回了思考过程，没有返回最终答案。请关闭 thinking，或提高 max_tokens。`);
   }
   throw new Error(`${label} 没有返回有效内容。`);
+}
+
+async function postJsonWithTimeout(targetUrl, { headers = {}, body, timeoutMs = 180_000, label = "请求" } = {}) {
+  const url = new URL(targetUrl);
+  const transport = url.protocol === "https:" ? https : http;
+  const payload = typeof body === "string" ? body : JSON.stringify(body);
+  const requestHeaders = {
+    "Content-Type": "application/json",
+    "Content-Length": Buffer.byteLength(payload),
+    ...headers,
+  };
+  return new Promise((resolve, reject) => {
+    const req = transport.request({
+      protocol: url.protocol,
+      hostname: url.hostname,
+      port: url.port || (url.protocol === "https:" ? 443 : 80),
+      path: `${url.pathname}${url.search}`,
+      method: "POST",
+      headers: requestHeaders,
+    }, (res) => {
+      let raw = "";
+      res.setEncoding("utf8");
+      res.on("data", (chunk) => {
+        raw += chunk;
+      });
+      res.on("end", () => {
+        if (res.statusCode < 200 || res.statusCode >= 300) {
+          reject(new Error(`${label} 文本生成失败: ${res.statusCode} ${raw.slice(0, 500)}`));
+          return;
+        }
+        try {
+          resolve(JSON.parse(raw));
+        } catch (error) {
+          reject(new Error(`${label} 返回了非 JSON 响应: ${raw.slice(0, 500)}`));
+        }
+      });
+    });
+    req.setTimeout(timeoutMs, () => {
+      req.destroy(new Error(`${label} 请求超时，已等待 ${Math.round(timeoutMs / 1000)} 秒。`));
+    });
+    req.on("error", (error) => {
+      reject(error);
+    });
+    req.write(payload);
+    req.end();
+  });
 }
 
 async function summarizeWithMock(lesson) {
@@ -1181,6 +1320,26 @@ async function summarizeWithMock(lesson) {
     homework_suggestion: ["整理本节课例题", "重做错题并标注易错点"],
     next_lesson_focus: ["继续强化综合题分析", "训练参数讨论和步骤表达"],
     covered_topics: ["导数综合题", "参数分析", "分类讨论", "规范表达"],
+    question_breakdown: [
+      {
+        problem_ref: "课堂前半段例题",
+        topic: "导数综合题",
+        teacher_focus: "参数分析",
+        student_issue: "条件梳理不够稳定",
+      },
+      {
+        problem_ref: "课堂后半段例题",
+        topic: "分类讨论",
+        teacher_focus: "规范表达",
+        student_issue: "计算细节需要加强",
+      },
+    ],
+    feedback_required_mentions: {
+      early_topics: ["导数综合题", "参数分析"],
+      late_topics: ["分类讨论", "规范表达"],
+      recurring_issues: ["条件梳理不够稳定", "分类讨论和计算细节需要加强"],
+      avoid_single_focus: "不能只围绕最后一道题展开",
+    },
     lesson_segments: [
       {
         phase: "前半段",
@@ -1233,6 +1392,20 @@ function structuredSummaryTemplate() {
     homework_suggestion: [],
     next_lesson_focus: [],
     covered_topics: [],
+    question_breakdown: [
+      {
+        problem_ref: "",
+        topic: "",
+        teacher_focus: "",
+        student_issue: "",
+      },
+    ],
+    feedback_required_mentions: {
+      early_topics: [],
+      late_topics: [],
+      recurring_issues: [],
+      avoid_single_focus: "",
+    },
     lesson_segments: [
       {
         phase: "前半段",
@@ -1271,6 +1444,14 @@ function transcriptBlockSummaryTemplate() {
     teaching_relevance: "high",
     problem_refs: [],
     covered_topics: [],
+    question_breakdown: [
+      {
+        problem_ref: "",
+        topic: "",
+        teacher_focus: "",
+        student_issue: "",
+      },
+    ],
     student_performance: "",
     strengths: [],
     weaknesses: [],
@@ -1292,6 +1473,8 @@ function normalizeStructuredSummary(value) {
     homework_suggestion: normalizeStringArray(summary.homework_suggestion),
     next_lesson_focus: normalizeStringArray(summary.next_lesson_focus),
     covered_topics: normalizeStringArray(summary.covered_topics),
+    question_breakdown: normalizeQuestionBreakdown(summary.question_breakdown),
+    feedback_required_mentions: normalizeFeedbackRequiredMentions(summary.feedback_required_mentions),
     lesson_segments: normalizeLessonSegments(summary.lesson_segments),
     recurring_weaknesses: normalizeRecurringWeaknesses(summary.recurring_weaknesses),
     coverage_check: normalizeCoverageCheck(summary.coverage_check),
@@ -1305,6 +1488,7 @@ function normalizeTranscriptBlockSummary(value) {
     teaching_relevance: relevance || "medium",
     problem_refs: normalizeStringArray(summary.problem_refs),
     covered_topics: normalizeStringArray(summary.covered_topics),
+    question_breakdown: normalizeQuestionBreakdown(summary.question_breakdown),
     student_performance: cleanString(summary.student_performance) || "未明确提及",
     strengths: normalizeStringArray(summary.strengths),
     weaknesses: normalizeStringArray(summary.weaknesses),
@@ -1370,6 +1554,273 @@ function normalizeStringArray(value) {
     }
     return [];
   }));
+}
+
+function normalizeQuestionBreakdown(value) {
+  if (!Array.isArray(value)) {
+    return [];
+  }
+  return value
+    .map((item) => {
+      const row = item && typeof item === "object" ? item : {};
+      return {
+        problem_ref: cleanString(row.problem_ref),
+        topic: cleanString(row.topic),
+        teacher_focus: cleanString(row.teacher_focus),
+        student_issue: cleanString(row.student_issue),
+      };
+    })
+    .filter((item) => item.problem_ref || item.topic || item.teacher_focus || item.student_issue);
+}
+
+function normalizeFeedbackRequiredMentions(value) {
+  const item = value && typeof value === "object" ? value : {};
+  return {
+    early_topics: normalizeStringArray(item.early_topics),
+    late_topics: normalizeStringArray(item.late_topics),
+    recurring_issues: normalizeStringArray(item.recurring_issues),
+    avoid_single_focus: cleanString(item.avoid_single_focus),
+  };
+}
+
+function buildTranscriptCoverageHints(transcript, sections = null) {
+  const source = String(transcript || "");
+  const normalizedSections = Array.isArray(sections) ? sections : splitTranscriptSections(source);
+  return {
+    problemRefs: inferProblemRefsFromText(source),
+    topicHints: inferTopicHintsFromText(source),
+    phaseHints: buildPhaseTopicHints(normalizedSections),
+  };
+}
+
+function buildBlockCoverageHints(group) {
+  const blockText = (Array.isArray(group) ? group : [])
+    .map((section) => `${section.label}\n${section.body}`)
+    .join("\n\n");
+  return {
+    problemRefs: inferProblemRefsFromText(blockText),
+    topicHints: inferTopicHintsFromText(blockText),
+    phaseHints: [],
+  };
+}
+
+function formatCoverageHints(hints) {
+  const normalized = hints && typeof hints === "object" ? hints : {};
+  const rows = [
+    `识别到的题号/题段：${(normalized.problemRefs || []).join("、") || "未识别到"}`,
+    `识别到的知识点：${(normalized.topicHints || []).join("、") || "未识别到"}`,
+  ];
+  for (const phase of normalized.phaseHints || []) {
+    rows.push(`${phase.phase}可能涉及：${phase.topics.join("、") || "未识别到明显教学知识点"}`);
+  }
+  return rows.join("\n");
+}
+
+function buildPhaseTopicHints(sections) {
+  if (!Array.isArray(sections) || sections.length === 0) {
+    return [];
+  }
+  const size = Math.max(1, Math.ceil(sections.length / 3));
+  const groups = groupItems(sections, size);
+  const phases = ["前半段", "中段", "后半段"];
+  return groups.slice(0, 3).map((group, index) => ({
+    phase: phases[index] || `阶段${index + 1}`,
+    topics: inferTopicHintsFromText(group.map((item) => item.body).join("\n")),
+  }));
+}
+
+function inferProblemRefsFromText(text) {
+  const source = String(text || "");
+  const matches = [...source.matchAll(/第[一二三四五六七八九十百零两\d]+题/g)].map((item) => item[0]);
+  return uniqueStrings(matches).slice(0, 12);
+}
+
+function inferTopicHintsFromText(text) {
+  const source = String(text || "");
+  return TOPIC_HINT_RULES
+    .filter((rule) => rule.keywords.some((keyword) => source.includes(keyword)))
+    .map((rule) => rule.label);
+}
+
+function mergePartialSummariesDeterministically(partials, globalHints = null) {
+  const source = Array.isArray(partials) ? partials : [];
+  const teachingPartials = source
+    .map((item) => ({
+      range: cleanString(item?.range),
+      summary: normalizeTranscriptBlockSummary(item?.summary),
+    }))
+    .filter((item) => item.summary.covered_topics.length > 0 || item.summary.question_breakdown.length > 0 || item.summary.strengths.length > 0 || item.summary.weaknesses.length > 0 || item.summary.teacher_observations.length > 0);
+  const phaseSegments = buildLessonSegmentsFromPartials(teachingPartials, globalHints);
+  const coveredTopics = uniqueStrings([
+    ...(globalHints?.topicHints || []),
+    ...teachingPartials.flatMap((item) => item.summary.covered_topics),
+    ...phaseSegments.flatMap((segment) => segment.knowledge_points),
+  ]).slice(0, 10);
+  const questionBreakdown = mergeQuestionBreakdown(teachingPartials.flatMap((item) => item.summary.question_breakdown)).slice(0, 8);
+  const strengths = pickTopFrequentStrings(teachingPartials.flatMap((item) => item.summary.strengths), 6);
+  const recurringWeaknesses = pickTopFrequentStrings([
+    ...teachingPartials.flatMap((item) => item.summary.weaknesses),
+    ...teachingPartials.flatMap((item) => item.summary.teacher_observations),
+    ...phaseSegments.flatMap((segment) => segment.issues),
+  ], 6);
+  const weaknesses = uniqueStrings([...recurringWeaknesses, ...teachingPartials.flatMap((item) => item.summary.weaknesses)]).slice(0, 6);
+  const typicalExamples = uniqueStrings([
+    ...teachingPartials.flatMap((item) => item.summary.typical_examples),
+    ...questionBreakdown.map((item) => [item.problem_ref, item.topic].filter(Boolean).join("：")),
+  ]).slice(0, 6);
+  const correctionSuggestions = uniqueStrings(teachingPartials.flatMap((item) => item.summary.correction_suggestions)).slice(0, 6);
+  const feedbackRequiredMentions = buildFeedbackRequiredMentions(phaseSegments, recurringWeaknesses, coveredTopics, globalHints);
+  const summary = {
+    lesson_content: buildLessonContent(coveredTopics, questionBreakdown),
+    student_performance: buildStudentPerformance(teachingPartials, strengths, recurringWeaknesses),
+    strengths,
+    weaknesses,
+    typical_examples: typicalExamples,
+    correction_suggestions: correctionSuggestions,
+    homework_suggestion: buildHomeworkSuggestions(correctionSuggestions, recurringWeaknesses),
+    next_lesson_focus: buildNextLessonFocus(coveredTopics, recurringWeaknesses),
+    covered_topics: coveredTopics,
+    question_breakdown: questionBreakdown,
+    feedback_required_mentions: feedbackRequiredMentions,
+    lesson_segments: phaseSegments,
+    recurring_weaknesses: recurringWeaknesses,
+    coverage_check: {
+      covered_early: phaseSegments[0]?.knowledge_points.length > 0,
+      covered_middle: phaseSegments[1]?.knowledge_points.length > 0,
+      covered_late: phaseSegments[2]?.knowledge_points.length > 0,
+      not_last_problem_only: feedbackRequiredMentions.early_topics.length > 0 && feedbackRequiredMentions.late_topics.length > 0,
+    },
+  };
+  return normalizeStructuredSummary(summary);
+}
+
+function buildLessonSegmentsFromPartials(partials, globalHints = null) {
+  const phases = ["前半段", "中段", "后半段"];
+  if (!Array.isArray(partials) || partials.length === 0) {
+    return phases.map((phase, index) => ({
+      phase,
+      problem_refs: [],
+      knowledge_points: uniqueStrings(globalHints?.phaseHints?.[index]?.topics || []),
+      student_performance: "未明确提及",
+      issues: [],
+    }));
+  }
+  const size = Math.max(1, Math.ceil(partials.length / 3));
+  return phases.map((phase, index) => {
+    const group = partials.slice(index * size, (index + 1) * size);
+    const hintedTopics = globalHints?.phaseHints?.[index]?.topics || [];
+    return {
+      phase,
+      problem_refs: uniqueStrings(group.flatMap((item) => item.summary.problem_refs).concat(group.flatMap((item) => item.summary.question_breakdown.map((row) => row.problem_ref)))).slice(0, 8),
+      knowledge_points: uniqueStrings([...hintedTopics, ...group.flatMap((item) => item.summary.covered_topics), ...group.flatMap((item) => item.summary.question_breakdown.map((row) => row.topic))]).slice(0, 8),
+      student_performance: summarizeSegmentPerformance(group),
+      issues: pickTopFrequentStrings([...group.flatMap((item) => item.summary.weaknesses), ...group.flatMap((item) => item.summary.teacher_observations)], 4),
+    };
+  });
+}
+
+function summarizeSegmentPerformance(group) {
+  const values = uniqueStrings((group || []).map((item) => item.summary.student_performance).filter((text) => text && text !== "未明确提及"));
+  return values.slice(0, 2).join("；") || "未明确提及";
+}
+
+function mergeQuestionBreakdown(items) {
+  const result = [];
+  const seen = new Set();
+  for (const item of items || []) {
+    const row = item && typeof item === "object" ? item : {};
+    const normalized = {
+      problem_ref: cleanString(row.problem_ref),
+      topic: cleanString(row.topic),
+      teacher_focus: cleanString(row.teacher_focus),
+      student_issue: cleanString(row.student_issue),
+    };
+    const key = [normalized.problem_ref, normalized.topic, normalized.teacher_focus, normalized.student_issue].join("|");
+    if (!key.replace(/\|/g, "")) {
+      continue;
+    }
+    if (seen.has(key)) {
+      continue;
+    }
+    seen.add(key);
+    result.push(normalized);
+  }
+  return result;
+}
+
+function pickTopFrequentStrings(values, limit = 5) {
+  const counts = new Map();
+  for (const value of values || []) {
+    const text = cleanString(value);
+    if (!text || text === "未明确提及") {
+      continue;
+    }
+    counts.set(text, (counts.get(text) || 0) + 1);
+  }
+  return [...counts.entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0], "zh-Hans-CN"))
+    .slice(0, limit)
+    .map(([text]) => text);
+}
+
+function buildFeedbackRequiredMentions(phaseSegments, recurringWeaknesses, coveredTopics, globalHints = null) {
+  const earlyTopics = uniqueStrings([
+    ...(phaseSegments[0]?.knowledge_points || []),
+    ...(globalHints?.phaseHints?.[0]?.topics || []),
+  ]).slice(0, 5);
+  const lateTopics = uniqueStrings([
+    ...(phaseSegments[2]?.knowledge_points || []),
+    ...(globalHints?.phaseHints?.[2]?.topics || []),
+    ...coveredTopics.filter((topic) => /立体几何|空间向量|解三角形|三角函数/.test(topic)),
+  ]).slice(0, 4);
+  return {
+    early_topics: earlyTopics,
+    late_topics: lateTopics,
+    recurring_issues: recurringWeaknesses.slice(0, 5),
+    avoid_single_focus: "最后一道题只能作为后半段内容之一，不能成为全文主线",
+  };
+}
+
+function buildLessonContent(coveredTopics, questionBreakdown) {
+  if (questionBreakdown.length >= 4 || coveredTopics.length >= 6) {
+    return `本节课主要围绕试卷中的多道疑问题进行了订正和梳理，覆盖了${coveredTopics.slice(0, 6).join("、")}等内容。`;
+  }
+  if (coveredTopics.length > 0) {
+    return `本节课主要梳理了${coveredTopics.slice(0, 5).join("、")}等内容。`;
+  }
+  return "未明确提及";
+}
+
+function buildStudentPerformance(partials, strengths, recurringWeaknesses) {
+  const performanceTexts = uniqueStrings((partials || []).map((item) => item.summary.student_performance).filter((text) => text && text !== "未明确提及"));
+  const pieces = [];
+  if (performanceTexts.length > 0) {
+    pieces.push(performanceTexts.slice(0, 2).join("；"));
+  }
+  if (strengths.length > 0) {
+    pieces.push(`整体亮点集中在${strengths.slice(0, 2).join("、")}。`);
+  }
+  if (recurringWeaknesses.length > 0) {
+    pieces.push(`反复暴露的问题主要是${recurringWeaknesses.slice(0, 2).join("、")}。`);
+  }
+  return pieces.join("") || "未明确提及";
+}
+
+function buildHomeworkSuggestions(correctionSuggestions, recurringWeaknesses) {
+  const base = uniqueStrings(correctionSuggestions).slice(0, 3);
+  if (base.length > 0) {
+    return base;
+  }
+  return recurringWeaknesses.slice(0, 3).map((item) => `围绕“${item}”做针对性订正和整理`);
+}
+
+function buildNextLessonFocus(coveredTopics, recurringWeaknesses) {
+  const topicFocus = coveredTopics.filter((item) => /立体几何|空间向量|概率|回归方程|函数|圆|欧拉线|解三角形|三角函数/.test(item));
+  const values = uniqueStrings([
+    ...recurringWeaknesses.map((item) => `继续强化${item}`),
+    ...topicFocus.slice(0, 3).map((item) => `继续梳理${item}`),
+  ]);
+  return values.slice(0, 4);
 }
 
 function splitTranscriptSections(transcript) {
@@ -2148,32 +2599,37 @@ function getFeedbackStyleSpec(style) {
   const map = {
     professional_warm: {
       label: "专业温和",
-      lengthRule: "字数控制在 220-340 字，完整但不要冗长。",
+      lengthRule: "字数控制在 300-420 字，完整但不要冗长。",
       instructions: [
         "语气要像认真负责的任课老师，克制、稳定、尊重家长，不夸张。",
-        "先概括课堂重点，再写课堂表现，接着写亮点和问题，最后给出课后建议与下节课重点。",
-        "指出问题时要温和、具体，避免情绪化表达和过度批评。",
-        "结尾保持礼貌、自然，适合直接发给家长。",
+        "结构贴近老师平时发给家长的课后反馈：先总述本节课内容，再写掌握得较好的部分，最后写还需要加强的部分。",
+        "“主要内容包括”后的编号内容要精炼，像题型和方法总结，不要写成课堂逐分钟记录。",
+        "亮点和问题都要写得具体，像老师课后复盘，不要写空泛表扬或生硬结论。",
+        "指出问题时要温和、具体，多用“还不够熟练”“有些疑惑”“没有马上想起来”这类表达，避免情绪化表达和过度批评。",
+        "建议和下节课计划自然落在最后一段，不要单独再起“改进策略”清单。",
       ],
     },
     concise: {
       label: "简洁版",
-      lengthRule: "整体控制在 170-240 字，尽量短，但关键信息不能缺。",
+      lengthRule: "整体控制在 240-320 字，尽量短，但关键信息不能缺。",
       instructions: [
-        "整体更短，尽量控制在 180-260 字，信息密度高，不铺陈。",
-        "每段只保留关键事实和最重要的建议，减少客套话。",
+        "整体更短，尽量控制在 240-320 字，信息密度高，不铺陈。",
+        "仍保持“总述本节课内容 -> 掌握得较好的部分 -> 还需要加强的部分”的三段结构。",
+        "“主要内容包括”控制在 3-4 条，只保留最关键的题型和方法。",
+        "每段只保留关键事实和最重要的建议，减少客套话和重复解释。",
         "语气仍要专业清晰，但不要写成长篇说明。",
-        "适合老师快速同步课堂情况给家长。",
+        "适合老师快速同步课堂情况给家长，但不要因为求短而写成机械提纲。",
       ],
     },
     wechat: {
       label: "微信口吻",
-      lengthRule: "字数控制在 200-300 字，读起来像一条自然的微信消息。",
+      lengthRule: "字数控制在 280-380 字，读起来像一条自然的微信消息。",
       instructions: [
         "语气更自然、更口语化，像老师在微信里单独发消息，不要生硬公文腔。",
         "保持礼貌和边界感，不要使用网络流行语，不要太随便。",
-        "表达要更顺口，可以适度加入“今天这节课”“这边建议”这类微信常见说法。",
-        "仍然要包含课堂重点、课堂表现、问题和建议，不能为了口语化漏信息。",
+        "表达要更顺口，可以适度加入“今天这节课”“这边看下来”这类老师微信里常见说法。",
+        "仍然保持三段结构，但段落之间要更自然，像老师手动输入的一条消息。",
+        "不要写成任务汇报或会议纪要，尤其不要再单独列“改进策略”清单。",
       ],
     },
   };

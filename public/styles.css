@@ -365,6 +365,50 @@ p {
   font-size: 15px;
 }
 
+.student-list-item {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: stretch;
+  padding: 0;
+  overflow: hidden;
+}
+
+.student-select-button {
+  width: 100%;
+  min-height: 86px;
+  border: 0;
+  border-radius: 0;
+  padding: 14px;
+  color: var(--text);
+  background: transparent;
+  box-shadow: none;
+  text-align: left;
+}
+
+.student-select-button:hover {
+  color: var(--text);
+  background: transparent;
+  box-shadow: none;
+  transform: none;
+}
+
+.student-copy-button {
+  align-self: center;
+  min-width: 56px;
+  min-height: 36px;
+  margin-right: 12px;
+  border-radius: 9px;
+  padding: 0 12px;
+  color: #1a5f58;
+  background: #f4fbfa;
+  border: 1px solid rgba(30, 166, 154, 0.18);
+  box-shadow: none;
+  font-size: 12px;
+}
+
+.student-copy-button:hover {
+  color: #fff;
+}
+
 .list-card {
   display: grid;
   grid-template-columns: 42px minmax(0, 1fr);
@@ -851,6 +895,15 @@ p {
   .inline-actions {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .student-list-item {
+    grid-template-columns: 1fr;
+  }
+
+  .student-copy-button {
+    width: auto;
+    margin: 0 12px 12px;
   }
 
   .summary-cards {
