@@ -35,11 +35,24 @@ const APP_ACCESS_TOKEN = process.env.APP_ACCESS_TOKEN || "";
 const LOCAL_TRANSCRIBE_PYTHON = process.env.LOCAL_TRANSCRIBE_PYTHON || "python3";
 const LOCAL_WHISPER_MODEL = process.env.LOCAL_WHISPER_MODEL || "medium";
 const LOCAL_WHISPER_LANGUAGE = process.env.LOCAL_WHISPER_LANGUAGE || "zh";
+const LOCAL_WHISPER_LIBRARY_PATH = process.env.LOCAL_WHISPER_LIBRARY_PATH || "";
 const LOCAL_WHISPER_BATCH_ENABLED = process.env.LOCAL_WHISPER_BATCH_ENABLED === undefined
   ? true
   : parseBoolean(process.env.LOCAL_WHISPER_BATCH_ENABLED);
 const LOCAL_TRANSCRIBE_SCRIPT = path.join(ROOT_DIR, "scripts", "transcribe_local.py");
 const LOCAL_DEP_MARKER = path.join(ROOT_DIR, ".pydeps", "faster_whisper");
+const DEFAULT_TRANSCRIBE_BACKEND = cleanString(process.env.DEFAULT_TRANSCRIBE_BACKEND || "remote").toLowerCase();
+const REMOTE_TRANSCRIBE_ENABLED = parseBoolean(process.env.REMOTE_TRANSCRIBE_ENABLED);
+const REMOTE_TRANSCRIBE_HOST = process.env.REMOTE_TRANSCRIBE_HOST || "";
+const REMOTE_TRANSCRIBE_USER = process.env.REMOTE_TRANSCRIBE_USER || "";
+const REMOTE_TRANSCRIBE_PASSWORD = process.env.REMOTE_TRANSCRIBE_PASSWORD || "";
+const REMOTE_TRANSCRIBE_PORT = Number(process.env.REMOTE_TRANSCRIBE_PORT || 22);
+const REMOTE_TRANSCRIBE_DIR = process.env.REMOTE_TRANSCRIBE_DIR || "/home/plusai/teacher_remote_transcribe";
+const REMOTE_TRANSCRIBE_PYTHON = process.env.REMOTE_TRANSCRIBE_PYTHON || "python3";
+const REMOTE_WHISPER_LIBRARY_PATH = process.env.REMOTE_WHISPER_LIBRARY_PATH || "";
+const REMOTE_TRANSCRIBE_SYNC_DEPS = process.env.REMOTE_TRANSCRIBE_SYNC_DEPS === undefined
+  ? true
+  : parseBoolean(process.env.REMOTE_TRANSCRIBE_SYNC_DEPS);
 const LOCAL_LLM_BASE_URL = (process.env.LOCAL_LLM_BASE_URL || "").replace(/\/$/, "");
 const LOCAL_LLM_API_KEY = process.env.LOCAL_LLM_API_KEY || "";
 const LOCAL_LLM_MODEL = process.env.LOCAL_LLM_MODEL || "";
@@ -86,6 +99,9 @@ const TOPIC_HINT_RULES = [
 ];
 
 let db = null;
+let remoteTranscribeReady = false;
+let saveDbQueue = Promise.resolve();
+let saveDbSequence = 0;
 const activeJobs = new Set();
 
 const MIME_BY_EXT = {
@@ -225,6 +241,21 @@ async function handleApi(req, res, pathname, url) {
     return;
   }
 
+  if (req.method === "PUT" && matchPath(pathname, "/api/students/:id")) {
+    const { id } = matchPath(pathname, "/api/students/:id");
+    const student = db.students.find((item) => item.id === Number(id));
+    if (!student) {
+      sendJson(res, 404, { error: "学生不存在" });
+      return;
+    }
+    const body = await readJson(req);
+    student.name = requiredString(body.name, "学生姓名不能为空");
+    student.updated_at = nowIso();
+    await saveDb();
+    sendJson(res, 200, { student });
+    return;
+  }
+
   if (req.method === "DELETE" && matchPath(pathname, "/api/students/:id")) {
     const { id } = matchPath(pathname, "/api/students/:id");
     const studentId = Number(id);
@@ -265,6 +296,7 @@ async function handleApi(req, res, pathname, url) {
       student_id: studentId,
       lesson_title: cleanString(body.lesson_title) || `${student.name} 的课堂记录`,
       lesson_time: cleanString(body.lesson_time) || now,
+      transcribe_backend: validateTranscribeBackend(body.transcribe_backend, false),
       feedback_generator: validateFeedbackGenerator(body.feedback_generator, false),
       feedback_style: validateFeedbackStyle(body.feedback_style, false),
       duration_sec: null,
@@ -294,9 +326,32 @@ async function handleApi(req, res, pathname, url) {
     if (body.feedback_generator !== undefined) {
       lesson.feedback_generator = validateFeedbackGenerator(body.feedback_generator, true);
     }
+    if (body.transcribe_backend !== undefined) {
+      lesson.transcribe_backend = validateTranscribeBackend(body.transcribe_backend, true);
+    }
     if (body.feedback_style !== undefined) {
       lesson.feedback_style = validateFeedbackStyle(body.feedback_style, true);
     }
+    lesson.updated_at = nowIso();
+    await saveDb();
+    sendJson(res, 200, lessonPayload(lesson));
+    return;
+  }
+
+  if (req.method === "PUT" && matchPath(pathname, "/api/lessons/:id")) {
+    const { id } = matchPath(pathname, "/api/lessons/:id");
+    const lesson = findLesson(Number(id));
+    if (!lesson) {
+      sendJson(res, 404, { error: "课程不存在" });
+      return;
+    }
+    const body = await readJson(req);
+    const title = cleanString(body.lesson_title);
+    if (!title) {
+      sendJson(res, 400, { error: "课程名称不能为空" });
+      return;
+    }
+    lesson.lesson_title = title;
     lesson.updated_at = nowIso();
     await saveDb();
     sendJson(res, 200, lessonPayload(lesson));
@@ -460,6 +515,9 @@ async function receiveRecording(req, res, lesson) {
   const uploadId = crypto.randomUUID();
   const lessonDir = path.join(UPLOAD_DIR, String(lesson.id));
   await fsp.mkdir(lessonDir, { recursive: true });
+  const recordingBatchId = cleanString(req.headers["x-recording-batch-id"]) || uploadId;
+  const recordingOrder = clampInteger(req.headers["x-recording-order"], 1, 1, 2);
+  const recordingTotal = clampInteger(req.headers["x-recording-total"], 1, 1, 2);
 
   let saved = null;
   if (contentType.startsWith("multipart/form-data")) {
@@ -468,10 +526,12 @@ async function receiveRecording(req, res, lesson) {
     saved = await receiveRawRecording(req, lessonDir, uploadId);
   }
 
-  await replaceLessonRecording(lesson.id, saved.path);
+  if (recordingOrder === 1) {
+    await replaceLessonRecording(lesson.id, saved.path);
+  }
 
   lesson.status = "audio_uploaded";
-  lesson.duration_sec = saved.durationSec;
+  lesson.duration_sec = sumLessonRecordingDurations(lesson.id, saved.durationSec);
   lesson.full_transcript = "";
   lesson.structured_summary = null;
   lesson.feedback_text = "";
@@ -483,6 +543,9 @@ async function receiveRecording(req, res, lesson) {
     id: nextId("recordings"),
     lesson_id: lesson.id,
     student_id: lesson.student_id,
+    recording_batch_id: recordingBatchId,
+    recording_order: recordingOrder,
+    recording_total: recordingTotal,
     original_audio_url: privateUrlFor("audio", lesson.id),
     original_audio_path: saved.path,
     original_audio_filename: saved.filename,
@@ -506,6 +569,8 @@ async function receiveRecording(req, res, lesson) {
   sendJson(res, 201, {
     lesson_id: lesson.id,
     recording_id: recording.id,
+    recording_order: recording.recording_order,
+    recording_total: recording.recording_total,
     status: "audio_uploaded",
   });
 }
@@ -577,7 +642,7 @@ async function processUploadedAudio(recordingId) {
     const metadata = await getAudioMetadata(recording.original_audio_path, recording.original_audio_format);
     recording.original_audio_duration_sec = recording.original_audio_duration_sec || metadata.durationSec;
     recording.original_audio_format = recording.original_audio_format || metadata.format;
-    lesson.duration_sec = lesson.duration_sec || metadata.durationSec;
+    lesson.duration_sec = sumLessonRecordingDurations(lesson.id);
     await saveDb();
 
     await createChunks(recording.id);
@@ -592,7 +657,10 @@ async function processUploadedAudio(recordingId) {
       .sort((a, b) => a.chunk_index - b.chunk_index);
 
     const pendingChunks = chunks.filter((chunk) => chunk.transcription_status !== "completed");
-    if (getEffectiveAiMode() === "local" && LOCAL_WHISPER_BATCH_ENABLED && pendingChunks.length > 1) {
+    const transcribeBackend = getLessonTranscribeBackend(lesson);
+    if (getEffectiveAiMode() === "local" && transcribeBackend === "remote") {
+      await processRemoteChunksInBatch(pendingChunks);
+    } else if (getEffectiveAiMode() === "local" && LOCAL_WHISPER_BATCH_ENABLED && pendingChunks.length > 1) {
       await processLocalChunksInBatch(pendingChunks);
     } else {
       for (const chunk of pendingChunks) {
@@ -699,6 +767,7 @@ async function createFfmpegChunks(recording, ffmpeg) {
     const chunk = {
       id: nextId("chunks"),
       recording_id: recording.id,
+      recording_order: recording.recording_order || 1,
       lesson_id: recording.lesson_id,
       student_id: recording.student_id,
       chunk_index: index + 1,
@@ -741,6 +810,7 @@ function createVirtualChunks(recording) {
     const chunk = {
       id: nextId("chunks"),
       recording_id: recording.id,
+      recording_order: recording.recording_order || 1,
       lesson_id: recording.lesson_id,
       student_id: recording.student_id,
       chunk_index: index + 1,
@@ -769,6 +839,7 @@ function createPassthroughChunk(recording) {
   const chunk = {
     id: nextId("chunks"),
     recording_id: recording.id,
+    recording_order: recording.recording_order || 1,
     lesson_id: recording.lesson_id,
     student_id: recording.student_id,
     chunk_index: 1,
@@ -834,16 +905,17 @@ async function processLocalChunksInBatch(chunks) {
     let results = [];
     let batchError = null;
     try {
-      const output = await runCommand(LOCAL_TRANSCRIBE_PYTHON, [
-        LOCAL_TRANSCRIBE_SCRIPT,
-        "--batch",
-        LOCAL_WHISPER_MODEL,
-        LOCAL_WHISPER_LANGUAGE,
-        ...pending.map((chunk) => chunk.chunk_audio_path),
-      ]);
-      results = JSON.parse(output.stdout || "{}").results || [];
+      results = await runLocalTranscribeBatch(pending, buildLocalWhisperEnv());
     } catch (error) {
-      batchError = error;
+      if (isCudaRuntimeError(error)) {
+        try {
+          results = await transcribeBatchAfterLocalCudaFailure(pending, error);
+        } catch (fallbackError) {
+          batchError = fallbackError;
+        }
+      } else {
+        batchError = error;
+      }
     }
 
     const resultByPath = new Map(results.map((result) => [result.path, result]));
@@ -866,6 +938,48 @@ async function processLocalChunksInBatch(chunks) {
   }
 }
 
+async function processRemoteChunksInBatch(chunks) {
+  let pending = chunks.filter((chunk) => chunk.transcription_status !== "completed" && chunk.retry_count < MAX_AUTO_RETRIES);
+  while (pending.length > 0) {
+    for (const chunk of pending) {
+      chunk.transcription_status = "transcribing";
+      chunk.error_message = "";
+      chunk.updated_at = nowIso();
+    }
+    await saveDb();
+
+    let results = [];
+    let batchError = null;
+    try {
+      results = await transcribeWithRemoteBatch(pending);
+    } catch (error) {
+      try {
+        results = await transcribeBatchAfterRemoteFailure(pending, error);
+      } catch (fallbackError) {
+        batchError = fallbackError;
+      }
+    }
+
+    for (let index = 0; index < pending.length; index += 1) {
+      const chunk = pending[index];
+      const result = results[index];
+      if (!batchError && result && !result.error) {
+        chunk.transcript_text = cleanString(result.text);
+        chunk.transcription_status = "completed";
+        chunk.error_message = "";
+      } else {
+        chunk.retry_count += 1;
+        chunk.transcription_status = "failed";
+        chunk.error_message = batchError?.message || result?.error || "远程转写失败";
+      }
+      chunk.updated_at = nowIso();
+    }
+    await saveDb();
+
+    pending = chunks.filter((chunk) => chunk.transcription_status !== "completed" && chunk.retry_count < MAX_AUTO_RETRIES);
+  }
+}
+
 async function transcribeChunk(chunkId) {
   const chunk = db.chunks.find((item) => item.id === chunkId);
   if (!chunk) {
@@ -877,10 +991,14 @@ async function transcribeChunk(chunkId) {
   await saveDb();
 
   const mode = getEffectiveAiMode();
+  const lesson = findLesson(chunk.lesson_id);
+  const transcribeBackend = getLessonTranscribeBackend(lesson);
   const text = mode === "openai"
     ? await transcribeWithOpenAi(chunk)
     : mode === "local"
-      ? await transcribeWithLocal(chunk)
+      ? transcribeBackend === "remote"
+        ? await transcribeWithRemote(chunk)
+        : await transcribeWithLocal(chunk)
       : await transcribeWithMock(chunk);
 
   chunk.transcript_text = text;
@@ -924,17 +1042,211 @@ async function transcribeWithOpenAi(chunk) {
 }
 
 async function transcribeWithLocal(chunk) {
-  if (!isLocalAiEnabled()) {
+  if (!isLocalTranscribeAvailable()) {
     throw new Error("本地转写依赖不可用");
   }
+  try {
+    return await runLocalTranscribeSingle(chunk, buildLocalWhisperEnv());
+  } catch (error) {
+    if (isCudaRuntimeError(error)) {
+      return transcribeSingleAfterLocalCudaFailure(chunk, error);
+    }
+    throw error;
+  }
+}
+
+async function runLocalTranscribeSingle(chunk, env) {
   const output = await runCommand(LOCAL_TRANSCRIBE_PYTHON, [
     LOCAL_TRANSCRIBE_SCRIPT,
     chunk.chunk_audio_path,
     LOCAL_WHISPER_MODEL,
     LOCAL_WHISPER_LANGUAGE,
-  ]);
+  ], { env });
   const parsed = JSON.parse(output.stdout || "{}");
   return cleanString(parsed.text);
+}
+
+async function runLocalTranscribeBatch(chunks, env) {
+  const output = await runCommand(LOCAL_TRANSCRIBE_PYTHON, [
+    LOCAL_TRANSCRIBE_SCRIPT,
+    "--batch",
+    LOCAL_WHISPER_MODEL,
+    LOCAL_WHISPER_LANGUAGE,
+    ...chunks.map((chunk) => chunk.chunk_audio_path),
+  ], { env });
+  return JSON.parse(output.stdout || "{}").results || [];
+}
+
+async function transcribeSingleAfterLocalCudaFailure(chunk, originalError) {
+  const errors = [originalError];
+  if (isRemoteTranscribeConfigured()) {
+    try {
+      markLessonRemoteFallback([chunk], originalError);
+      await saveDb();
+      return await transcribeWithRemote(chunk);
+    } catch (remoteError) {
+      errors.push(remoteError);
+    }
+  }
+  try {
+    markLessonCpuFallback([chunk], originalError);
+    await saveDb();
+    return await runLocalTranscribeSingle(chunk, buildCpuWhisperEnv());
+  } catch (cpuError) {
+    errors.push(cpuError);
+  }
+  throw combineFallbackErrors(errors);
+}
+
+async function transcribeBatchAfterLocalCudaFailure(chunks, originalError) {
+  const errors = [originalError];
+  if (isRemoteTranscribeConfigured()) {
+    try {
+      markLessonRemoteFallback(chunks, originalError);
+      return await transcribeWithRemoteBatch(chunks);
+    } catch (remoteError) {
+      errors.push(remoteError);
+    }
+  }
+  try {
+    markLessonCpuFallback(chunks, originalError);
+    return await runLocalTranscribeBatch(chunks, buildCpuWhisperEnv());
+  } catch (cpuError) {
+    errors.push(cpuError);
+  }
+  throw combineFallbackErrors(errors);
+}
+
+async function transcribeSingleAfterRemoteFailure(chunk, originalError) {
+  const errors = [originalError];
+  if (isLocalTranscribeAvailable()) {
+    try {
+      markLessonLocalFallback([chunk], originalError);
+      await saveDb();
+      return await runLocalTranscribeSingle(chunk, buildLocalWhisperEnv());
+    } catch (localError) {
+      errors.push(localError);
+    }
+    try {
+      markLessonCpuFallback([chunk], originalError);
+      await saveDb();
+      return await runLocalTranscribeSingle(chunk, buildCpuWhisperEnv());
+    } catch (cpuError) {
+      errors.push(cpuError);
+    }
+  }
+  throw combineFallbackErrors(errors);
+}
+
+async function transcribeBatchAfterRemoteFailure(chunks, originalError) {
+  const errors = [originalError];
+  if (isLocalTranscribeAvailable()) {
+    try {
+      markLessonLocalFallback(chunks, originalError);
+      return await runLocalTranscribeBatch(chunks, buildLocalWhisperEnv());
+    } catch (localError) {
+      errors.push(localError);
+    }
+    try {
+      markLessonCpuFallback(chunks, originalError);
+      return await runLocalTranscribeBatch(chunks, buildCpuWhisperEnv());
+    } catch (cpuError) {
+      errors.push(cpuError);
+    }
+  }
+  throw combineFallbackErrors(errors);
+}
+
+async function transcribeWithRemote(chunk) {
+  let results = [];
+  try {
+    results = await transcribeWithRemoteBatch([chunk]);
+  } catch (error) {
+    return transcribeSingleAfterRemoteFailure(chunk, error);
+  }
+  const result = results[0] || {};
+  if (result.error) {
+    throw new Error(result.error);
+  }
+  return cleanString(result.text);
+}
+
+async function transcribeWithRemoteBatch(chunks) {
+  if (!isRemoteTranscribeConfigured()) {
+    throw new Error("远程转写未配置。请设置 REMOTE_TRANSCRIBE_ENABLED=1、REMOTE_TRANSCRIBE_HOST、REMOTE_TRANSCRIBE_USER 和 REMOTE_TRANSCRIBE_PASSWORD。");
+  }
+  const sourceChunks = Array.isArray(chunks) ? chunks : [];
+  if (sourceChunks.length === 0) {
+    return [];
+  }
+  await ensureRemoteTranscribeReady();
+
+  const batchId = `${Date.now()}_${crypto.randomBytes(4).toString("hex")}`;
+  const remoteWorkDir = `${REMOTE_TRANSCRIBE_DIR}/work/${batchId}`;
+  await remoteSsh(`mkdir -p ${shellQuote(remoteWorkDir)}`);
+
+  const remotePaths = [];
+  try {
+    for (let index = 0; index < sourceChunks.length; index += 1) {
+      const chunk = sourceChunks[index];
+      const ext = path.extname(chunk.chunk_audio_path || "") || ".audio";
+      const remotePath = `${remoteWorkDir}/chunk_${String(index + 1).padStart(3, "0")}${ext}`;
+      await remoteScpTo(chunk.chunk_audio_path, remotePath);
+      remotePaths.push(remotePath);
+    }
+
+    const envPrefix = buildRemoteWhisperEnvPrefix();
+    const command = [
+      `cd ${shellQuote(REMOTE_TRANSCRIBE_DIR)}`,
+      [
+        envPrefix,
+        shellQuote(REMOTE_TRANSCRIBE_PYTHON),
+        "scripts/transcribe_local.py",
+        "--batch",
+        shellQuote(LOCAL_WHISPER_MODEL),
+        shellQuote(LOCAL_WHISPER_LANGUAGE),
+        ...remotePaths.map(shellQuote),
+      ].filter(Boolean).join(" "),
+    ].join(" && ");
+    const output = await remoteSsh(command);
+    const parsed = JSON.parse(output.stdout || "{}");
+    const results = Array.isArray(parsed.results) ? parsed.results : [];
+    return sourceChunks.map((chunk, index) => {
+      const result = results[index] || {};
+      return {
+        ...result,
+        path: chunk.chunk_audio_path,
+      };
+    });
+  } finally {
+    await remoteSsh(`rm -rf ${shellQuote(remoteWorkDir)}`).catch(() => {});
+  }
+}
+
+async function ensureRemoteTranscribeReady() {
+  if (remoteTranscribeReady) {
+    return;
+  }
+  if (!fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)) {
+    throw new Error("本地转写脚本不存在，无法同步到远端。");
+  }
+  await remoteSsh(`mkdir -p ${shellQuote(REMOTE_TRANSCRIBE_DIR)} ${shellQuote(`${REMOTE_TRANSCRIBE_DIR}/scripts`)} ${shellQuote(`${REMOTE_TRANSCRIBE_DIR}/work`)}`);
+
+  const marker = `${REMOTE_TRANSCRIBE_DIR}/.pydeps/faster_whisper`;
+  const markerCheck = await remoteSsh(`test -d ${shellQuote(marker)}`).then(() => true).catch(() => false);
+  if (!markerCheck) {
+    if (!REMOTE_TRANSCRIBE_SYNC_DEPS) {
+      throw new Error("远端缺少 faster_whisper 依赖，且 REMOTE_TRANSCRIBE_SYNC_DEPS 未开启。");
+    }
+    if (!fs.existsSync(path.join(ROOT_DIR, ".pydeps", "faster_whisper"))) {
+      throw new Error("本地 .pydeps/faster_whisper 不存在，无法同步远端依赖。");
+    }
+    await remoteScpTo(path.join(ROOT_DIR, ".pydeps"), `${REMOTE_TRANSCRIBE_DIR}/`);
+  }
+
+  await remoteScpTo(LOCAL_TRANSCRIBE_SCRIPT, `${REMOTE_TRANSCRIBE_DIR}/scripts/transcribe_local.py`);
+  await remoteSsh(`cd ${shellQuote(REMOTE_TRANSCRIBE_DIR)} && ${shellQuote(REMOTE_TRANSCRIBE_PYTHON)} -c ${shellQuote("import sys; sys.path.insert(0, '.pydeps'); import faster_whisper; print('ok')")}`);
+  remoteTranscribeReady = true;
 }
 
 async function transcribeWithMock(chunk) {
@@ -954,14 +1266,20 @@ async function finalizeIfChunksComplete(lessonId) {
   if (!lesson) {
     return;
   }
-  const recording = latestRecording(lessonId);
-  if (!recording) {
+  const recordings = orderedLessonRecordings(lessonId);
+  if (recordings.length === 0) {
     return;
   }
-  const chunks = db.chunks
-    .filter((chunk) => chunk.recording_id === recording.id)
-    .sort((a, b) => a.chunk_index - b.chunk_index);
+  const expectedRecordings = Math.max(...recordings.map((recording) => Number(recording.recording_total || 1)));
+  if (recordings.length < expectedRecordings) {
+    return;
+  }
+  const chunks = orderedLessonChunks(lessonId);
   if (chunks.length === 0) {
+    return;
+  }
+  const recordingIdsWithChunks = new Set(chunks.map((chunk) => chunk.recording_id));
+  if (recordings.some((recording) => !recordingIdsWithChunks.has(recording.id))) {
     return;
   }
   const failed = chunks.filter((chunk) => chunk.transcription_status === "failed");
@@ -980,9 +1298,12 @@ async function finalizeIfChunksComplete(lessonId) {
 
   lesson.status = "transcribed";
   lesson.full_transcript = mergeTranscript(chunks);
+  lesson.duration_sec = sumLessonRecordingDurations(lesson.id);
   lesson.updated_at = nowIso();
-  recording.transcription_status = "completed";
-  recording.updated_at = nowIso();
+  for (const recording of recordings) {
+    recording.transcription_status = "completed";
+    recording.updated_at = nowIso();
+  }
   await saveDb();
   await summarizeAndGenerate(lesson.id, {
     style: getLessonFeedbackStyle(lesson),
@@ -996,6 +1317,24 @@ async function summarizeAndGenerate(lessonId, options = {}) {
   if (!lesson) {
     return;
   }
+  const generator = validateFeedbackGenerator(options.generator ?? lesson.feedback_generator, true);
+  if (generator === "none") {
+    const recordings = orderedLessonRecordings(lesson.id);
+    lesson.feedback_generator = generator;
+    lesson.structured_summary = null;
+    lesson.feedback_text = "";
+    lesson.teacher_edited_feedback = "";
+    lesson.status = "completed";
+    lesson.error_message = "";
+    lesson.updated_at = nowIso();
+    for (const recording of recordings) {
+      recording.transcription_status = "completed";
+      recording.updated_at = nowIso();
+    }
+    await saveDb();
+    return;
+  }
+
   lesson.status = "summarizing";
   lesson.error_message = "";
   lesson.updated_at = nowIso();
@@ -1003,9 +1342,8 @@ async function summarizeAndGenerate(lessonId, options = {}) {
 
   try {
     const mode = getEffectiveAiMode();
-    const generator = validateFeedbackGenerator(options.generator ?? lesson.feedback_generator, true);
     const style = validateFeedbackStyle(options.style ?? lesson.feedback_style, false);
-    const recording = latestRecording(lesson.id);
+    const recordings = orderedLessonRecordings(lesson.id);
     const summary = mode === "mock"
       ? await summarizeWithMock(lesson)
       : await summarizeWithLlm(lesson.full_transcript, generator);
@@ -1014,11 +1352,11 @@ async function summarizeAndGenerate(lessonId, options = {}) {
     lesson.feedback_style = style;
     lesson.feedback_text = mode === "mock"
       ? await feedbackWithMock(lesson, summary, { ...options, style })
-      : await feedbackWithLlm(summary, { ...options, style }, generator);
+      : await feedbackWithLlm(lesson, summary, { ...options, style }, generator);
     lesson.teacher_edited_feedback = lesson.feedback_text;
     lesson.status = "feedback_generated";
     lesson.updated_at = nowIso();
-    if (recording) {
+    for (const recording of recordings) {
       recording.transcription_status = "completed";
       recording.updated_at = nowIso();
     }
@@ -1141,42 +1479,60 @@ async function mergePartialSummariesWithLlm(partials, generator, globalHints = n
   return mergePartialSummariesDeterministically(partials, globalHints);
 }
 
-async function feedbackWithLlm(summary, options = {}, generator) {
+async function feedbackWithLlm(lesson, summary, options = {}, generator) {
   const style = validateFeedbackStyle(options.style, false);
   const styleSpec = getFeedbackStyleSpec(style);
+  const studentName = getLessonStudentName(lesson);
+  const studentLabel = studentName || "孩子";
+  const parentGreeting = studentName ? `${studentName}妈妈您好！` : "家长您好！";
   const content = [
-    "你是一名高中数学老师。请根据下面的课堂结构化信息，生成一段适合发给家长的课后反馈。",
+    "请根据下面的课堂录音转写，生成一份数学课后反馈，直接给学生家长看。",
     "要求：",
-    "1. 严格使用指定的反馈风格，不要混用。",
-    "2. 不要太官方，不要像机器生成。",
-    "3. 既要肯定学生，也要指出需要改进的地方。",
-    `4. ${styleSpec.lengthRule}`,
-    "5. 不要出现“根据转写稿”“AI”“模型”等字样。",
-    "6. 不要编造课堂中没有出现的内容。",
-    "7. 必须优先使用 feedback_required_mentions、covered_topics、lesson_segments、question_breakdown、recurring_weaknesses 去覆盖整节课，不能只围绕最后一道题展开。",
-    "8. 输出结构固定参考老师日常“课后反馈”口吻：",
-    "   - 第一部分：先向家长问好，再用一句话概括本节课主线，然后写“主要内容包括：”",
-    "   - 第二部分：写“掌握得较好的部分：”",
-    "   - 第三部分：写“还需要加强的部分：”",
-    "9. 如果课堂明显是在订正一张卷子或集中梳理多道题，第一部分必须明确写出“围绕试卷中的疑问题进行订正和梳理”这类意思，不要误写成只讲一个专题。",
-    "10. “主要内容包括”后面写 4-6 条编号内容，每条概括一个知识模块、题型或方法，不按题号顺序复述课堂过程，不要写成逐题流水账。",
-    "11. 这 4-6 条里，至少 2 条来自前半段或中段内容，至少 1 条来自后半段内容；如果中段主要是过渡，则以前半段和后半段覆盖为主。",
-    "12. 如果 feedback_required_mentions.early_topics 非空，正文里至少要覆盖其中 3 个前半段知识点；如果 late_topics 非空，正文里至少要覆盖其中 2 个后半段知识点。",
-    "13. “掌握得较好的部分”写成一个自然段，至少 2 句，先写孩子当前掌握得较好的内容、思路方向、跟随度或在提示后能修正的地方，再写本节课的具体进步或收获。",
-    "14. “还需要加强的部分”也写成一个自然段，至少 2 句，先点出 1-3 个整节课反复出现的共性问题，再自然带出课后复盘建议、下节课抽查重点或后续训练方向。",
-    "15. 问题部分优先写整节课反复出现的共性问题，例如图像不准、概念记忆不牢、方法切换不灵活、计算表达不稳等，而不是只写最后一道题；措辞尽量使用“还不够熟练”“有些疑惑”“没有马上想起来”“需要再体会一下”这类老师口吻。",
-    "16. 避免使用“针对这些问题，我制定了以下改进策略：”“总体表现良好但……”这类报告腔模板；课后建议和下节课重点要自然地融入“还需要加强的部分”结尾，不要单独再起一段。",
-    "17. 如果 structured_summary 里已有多题型覆盖，正文必须体现这种广度，不要把“主要内容包括”缩成 2 个专题。",
-    "18. 除“主要内容包括”的编号外，其余部分不要再堆砌条目、子标题或步骤清单。",
-    `19. 风格代号：${style}；风格名称：${styleSpec.label}；长度：${options.length || "medium"}。`,
-    "20. 风格细则：",
+    "1. 只基于当前课程的课堂文字和由这份课堂文字整理出的信息生成，不要加入课堂中没有出现的知识点、题型、学生表现或评价。",
+    "2. 不要代入其他学生的内容。",
+    "3. 语气要像高中数学老师发给家长的课后反馈，自然、具体、简洁，不要像 AI 报告、教研报告或学习诊断报告。",
+    "4. 不要使用 emoji、表格、Markdown 小标题符号、加粗符号。",
+    "5. 不要出现“课堂整体概况、核心知识点覆盖、薄弱领域、高频问题、教学策略、逻辑闭环、复杂情境、几何直觉严谨化”等报告式表达。",
+    "6. 不要使用过重的负面评价，比如“能力较弱、理解障碍、明显短板、逻辑跳跃严重”。请改成“还需要继续加强”“目前还不够熟练”“后续需要注意”。",
+    "7. 不要出现“根据转写稿”“AI”“模型”“结构化信息”等字样。",
+    "",
+    "输出结构固定为：",
+    `${parentGreeting}`,
+    `今天这节课我主要带${studentLabel}……主要内容包括：`,
+    "1. ...",
+    "2. ...",
+    "3. ...",
+    "4. ...",
+    "5. ...",
+    "",
+    "掌握得较好的部分：",
+    "...",
+    "",
+    "还需要加强的部分：",
+    "...",
+    "",
+    "整体来看：",
+    "...",
+    "",
+    "具体要求：",
+    "1. 只有“主要内容包括”部分使用序号，其他部分不要使用序号、项目符号或表格。",
+    "2. 主要内容写 5 到 8 条即可，优先选择课堂中反复讲到、真正重点讲解的内容。",
+    "3. “掌握得较好的部分”要结合课堂中学生实际表现，比如“在老师引导后能够……”“能够想到……”“基础框架是有的”。",
+    "4. “还需要加强的部分”要具体指出课堂中暴露的问题，比如公式混淆、范围遗漏、图像分析不完整、几何推导不严谨等，但语气要平和。",
+    "5. “整体来看”简短收束，写后续重点复盘方向即可。",
+    "6. 字数控制在 500 到 700 字左右。",
+    "7. 语言要适合直接复制发给家长。",
+    "8. 如果课堂是在订正试卷或梳理多道题，第一段要如实写“围绕试卷中的疑问题进行订正和梳理”，不要误写成只讲一个专题。",
+    "9. 必须覆盖整节课，不能只围绕最后一道题展开；如果前半段和后半段都出现了教学内容，都要在正文中体现。",
+    `10. 风格代号：${style}；风格名称：${styleSpec.label}。`,
+    "11. 风格细则：",
     ...styleSpec.instructions.map((item, index) => `${index + 1}. ${item}`),
     "",
-    "课堂结构化信息：",
+    "课堂录音转写整理信息如下，所有反馈内容都只能从这里取材：",
     JSON.stringify(summary, null, 2),
   ].join("\n");
   return chatWithFeedbackGenerator(generator, [
-    { role: "developer", content: "你是一名认真负责的高中数学老师，输出适合直接发给家长的中文反馈。" },
+    { role: "developer", content: "你是一名认真负责的高中数学老师，只输出适合直接发给家长的中文课后反馈。" },
     { role: "user", content },
   ]);
 }
@@ -1368,17 +1724,26 @@ async function summarizeWithMock(lesson) {
 
 async function feedbackWithMock(lesson, summary, options = {}) {
   await delay(250);
-  const topics = normalizeStringArray(summary.covered_topics).slice(0, 3);
+  const studentName = getLessonStudentName(lesson);
+  const studentLabel = studentName || "孩子";
+  const parentGreeting = studentName ? `${studentName}妈妈您好！` : "家长您好！";
+  const topics = normalizeStringArray(summary.covered_topics).slice(0, 5);
   const strengths = normalizeStringArray(summary.strengths).slice(0, 2).join("，") || "课堂状态比较认真";
   const weaknesses = normalizeStringArray(summary.weaknesses).slice(0, 2).join("，") || "综合题中的条件梳理和计算细节";
   const advice = normalizeStringArray(summary.homework_suggestion).slice(0, 2).join("，") || "把今天讲过的例题重新整理一遍";
-  return `家长您好！
-今天这节课我主要带孩子对${summary.lesson_content || lesson.lesson_title || "本节课堂重点"}进行了梳理和练习。主要包括：
+  return `${parentGreeting}
+今天这节课我主要带${studentLabel}对${summary.lesson_content || lesson.lesson_title || "本节课堂重点"}进行了梳理和练习。主要内容包括：
 1. ${topics[0] || "课堂重点复盘"}
 2. ${topics[1] || "核心方法训练"}
 3. ${topics[2] || "易错点纠正"}
+4. ${topics[3] || "典型题型梳理"}
+5. ${topics[4] || "表达和计算细节规范"}
+
 掌握得较好的部分：${strengths}。
-还需要加强的部分：${weaknesses}。课后建议孩子${advice}，下节课会继续强化相关综合题的分析方法和规范表达。`;
+
+还需要加强的部分：${weaknesses}。
+
+整体来看：这节课${studentLabel}能跟着课堂节奏完成主要内容，课后建议${studentLabel}${advice}，下节课会继续结合今天暴露出的细节问题做巩固。`;
 }
 
 function structuredSummaryTemplate() {
@@ -1871,10 +2236,7 @@ function buildSectionRangeLabel(group) {
 
 function statusPayload(lessonId) {
   const lesson = findLesson(lessonId);
-  const recording = latestRecording(lessonId);
-  const chunks = recording
-    ? db.chunks.filter((chunk) => chunk.recording_id === recording.id)
-    : [];
+  const chunks = orderedLessonChunks(lessonId);
   const completed = chunks.filter((chunk) => chunk.transcription_status === "completed").length;
   const failed = chunks.filter((chunk) => chunk.transcription_status === "failed").length;
   const total = chunks.length;
@@ -1892,17 +2254,19 @@ function statusPayload(lessonId) {
     failed_chunks: failed,
     progress,
     error_message: lesson?.error_message || "",
-    chunks: chunks.sort((a, b) => a.chunk_index - b.chunk_index).map(publicChunk),
+    chunks: chunks.map(publicChunk),
   };
 }
 
 function lessonPayload(lesson) {
   const student = db.students.find((item) => item.id === lesson.student_id) || null;
   const recording = latestRecording(lesson.id);
+  const recordings = orderedLessonRecordings(lesson.id);
   return {
     lesson,
     student,
     recording: recording ? publicRecording(recording) : null,
+    recordings: recordings.map(publicRecording),
     status: statusPayload(lesson.id),
   };
 }
@@ -1911,6 +2275,8 @@ function publicRecording(recording) {
   return {
     id: recording.id,
     lesson_id: recording.lesson_id,
+    recording_order: recording.recording_order || 1,
+    recording_total: recording.recording_total || 1,
     original_audio_url: recording.original_audio_url,
     original_audio_filename: recording.original_audio_filename,
     original_audio_size: recording.original_audio_size,
@@ -1927,6 +2293,8 @@ function publicRecording(recording) {
 function publicChunk(chunk) {
   return {
     id: chunk.id,
+    recording_id: chunk.recording_id,
+    recording_order: getChunkRecordingOrder(chunk),
     chunk_index: chunk.chunk_index,
     start_time_sec: chunk.start_time_sec,
     end_time_sec: chunk.end_time_sec,
@@ -1943,6 +2311,7 @@ async function buildConfigPayload(req) {
   const effectiveMode = getEffectiveAiMode();
   const localLlmInfo = await getLocalLlmRuntimeInfo();
   const accessInfo = getAccessInfo(PORT);
+  const defaultTranscribeBackend = validateTranscribeBackend(DEFAULT_TRANSCRIBE_BACKEND, false);
   return {
     aiProvider: AI_PROVIDER,
     effectiveAiMode: effectiveMode,
@@ -1960,7 +2329,12 @@ async function buildConfigPayload(req) {
     ffprobeAvailable: Boolean(findOnPath("ffprobe")),
     maxLiveAudioMb: MAX_LIVE_AUDIO_MB,
     maxOpenAiAudioMb: MAX_OPENAI_AUDIO_MB,
-    localWhisperAvailable: isLocalAiEnabled(),
+    localWhisperAvailable: isLocalTranscribeAvailable(),
+    remoteTranscribeConfigured: isRemoteTranscribeConfigured(),
+    remoteTranscribeHost: REMOTE_TRANSCRIBE_HOST,
+    remoteTranscribeSummary: getRemoteTranscribeSummary(),
+    defaultTranscribeBackend,
+    transcribeBackendSummary: getTranscribeBackendSummary(defaultTranscribeBackend),
     localLlmConfigured: localLlmInfo.configured,
     localLlmReachable: localLlmInfo.reachable,
     localLlmFeedbackAvailable: localLlmInfo.available,
@@ -2010,12 +2384,14 @@ async function markLessonFailedByRecording(recordingId, error) {
 }
 
 function mergeTranscript(chunks) {
-  return chunks
-    .sort((a, b) => a.chunk_index - b.chunk_index)
+  const sorted = sortChunksInLessonOrder(chunks);
+  const hasMultipleRecordings = new Set(sorted.map((chunk) => chunk.recording_id)).size > 1;
+  return sorted
     .map((chunk) => {
+      const recordingLabel = hasMultipleRecordings ? `第${getChunkRecordingOrder(chunk)}段录音 ` : "";
       const label = chunk.transcription_status === "completed"
-        ? `【${formatTime(chunk.start_time_sec)}-${formatTime(chunk.end_time_sec)}】`
-        : `【${formatTime(chunk.start_time_sec)}-${formatTime(chunk.end_time_sec)}：缺失片段，状态 ${chunk.transcription_status}】`;
+        ? `【${recordingLabel}${formatTime(chunk.start_time_sec)}-${formatTime(chunk.end_time_sec)}】`
+        : `【${recordingLabel}${formatTime(chunk.start_time_sec)}-${formatTime(chunk.end_time_sec)}：缺失片段，状态 ${chunk.transcription_status}】`;
       return `${label}\n${chunk.transcript_text || chunk.error_message || "未生成转写"}`;
     })
     .join("\n\n");
@@ -2143,10 +2519,14 @@ async function loadDb() {
 }
 
 async function saveDb() {
-  await fsp.mkdir(DATA_DIR, { recursive: true });
-  const tempPath = `${DB_PATH}.${process.pid}.tmp`;
-  await fsp.writeFile(tempPath, JSON.stringify(db, null, 2), "utf8");
-  await fsp.rename(tempPath, DB_PATH);
+  const writeJob = saveDbQueue.then(async () => {
+    await fsp.mkdir(DATA_DIR, { recursive: true });
+    const tempPath = `${DB_PATH}.${process.pid}.${Date.now()}.${saveDbSequence += 1}.tmp`;
+    await fsp.writeFile(tempPath, JSON.stringify(db, null, 2), "utf8");
+    await fsp.rename(tempPath, DB_PATH);
+  });
+  saveDbQueue = writeJob.catch(() => {});
+  await writeJob;
 }
 
 function nextId(table) {
@@ -2159,10 +2539,52 @@ function findLesson(id) {
   return db.lessons.find((lesson) => lesson.id === Number(id));
 }
 
+function getLessonStudentName(lesson) {
+  const student = db.students.find((item) => item.id === lesson?.student_id);
+  return cleanString(student?.name);
+}
+
 function latestRecording(lessonId) {
+  return orderedLessonRecordings(lessonId).slice(-1)[0] || null;
+}
+
+function orderedLessonRecordings(lessonId) {
   return db.recordings
     .filter((recording) => recording.lesson_id === lessonId)
-    .sort((a, b) => b.id - a.id)[0] || null;
+    .sort((a, b) => (Number(a.recording_order || 1) - Number(b.recording_order || 1)) || (a.id - b.id));
+}
+
+function orderedLessonChunks(lessonId) {
+  return sortChunksInLessonOrder(db.chunks.filter((chunk) => chunk.lesson_id === lessonId));
+}
+
+function sortChunksInLessonOrder(chunks) {
+  return [...chunks].sort((a, b) => {
+    const orderDiff = getChunkRecordingOrder(a) - getChunkRecordingOrder(b);
+    if (orderDiff !== 0) {
+      return orderDiff;
+    }
+    return (a.chunk_index - b.chunk_index) || (a.id - b.id);
+  });
+}
+
+function getChunkRecordingOrder(chunk) {
+  if (chunk.recording_order) {
+    return Number(chunk.recording_order) || 1;
+  }
+  const recording = db.recordings.find((item) => item.id === chunk.recording_id);
+  return Number(recording?.recording_order || 1);
+}
+
+function sumLessonRecordingDurations(lessonId, extraDuration = null) {
+  const values = orderedLessonRecordings(lessonId)
+    .map((recording) => Number(recording.original_audio_duration_sec || 0))
+    .filter((value) => value > 0);
+  const extra = Number(extraDuration || 0);
+  if (extra > 0) {
+    values.push(extra);
+  }
+  return values.length > 0 ? Math.round(values.reduce((sum, value) => sum + value, 0)) : null;
 }
 
 async function deleteLessonFiles(lessonId) {
@@ -2318,9 +2740,9 @@ function getMultipartBoundary(contentType) {
   return /boundary=([^;]+)/i.exec(contentType)?.[1]?.replace(/^"|"$/g, "");
 }
 
-function runCommand(command, args) {
+function runCommand(command, args, options = {}) {
   return new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(command, args, { stdio: ["ignore", "pipe", "pipe"], env: options.env || process.env });
     const stdout = [];
     const stderr = [];
     child.stdout.on("data", (chunk) => stdout.push(chunk));
@@ -2338,6 +2760,145 @@ function runCommand(command, args) {
       }
     });
   });
+}
+
+function remoteSsh(command) {
+  return runCommand("sshpass", [
+    "-p",
+    REMOTE_TRANSCRIBE_PASSWORD,
+    "ssh",
+    "-p",
+    String(REMOTE_TRANSCRIBE_PORT),
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    "ServerAliveInterval=60",
+    "-o",
+    "ServerAliveCountMax=3",
+    `${REMOTE_TRANSCRIBE_USER}@${REMOTE_TRANSCRIBE_HOST}`,
+    command,
+  ]);
+}
+
+async function remoteScpTo(localPath, remotePath) {
+  const stat = await fsp.stat(localPath);
+  const args = [
+    "-p",
+    REMOTE_TRANSCRIBE_PASSWORD,
+    "scp",
+    "-P",
+    String(REMOTE_TRANSCRIBE_PORT),
+    "-o",
+    "StrictHostKeyChecking=no",
+    "-o",
+    "ConnectTimeout=8",
+    "-o",
+    "ServerAliveInterval=60",
+    "-o",
+    "ServerAliveCountMax=3",
+  ];
+  if (stat.isDirectory()) {
+    args.push("-r");
+  }
+  args.push(localPath, `${REMOTE_TRANSCRIBE_USER}@${REMOTE_TRANSCRIBE_HOST}:${remotePath}`);
+  return runCommand("sshpass", args);
+}
+
+function buildRemoteWhisperEnvPrefix() {
+  const values = {
+    LD_LIBRARY_PATH: buildRemoteWhisperLibraryPath(),
+    LOCAL_WHISPER_DEVICE: process.env.LOCAL_WHISPER_DEVICE,
+    LOCAL_WHISPER_COMPUTE_TYPE: process.env.LOCAL_WHISPER_COMPUTE_TYPE,
+    LOCAL_WHISPER_CPU_THREADS: process.env.LOCAL_WHISPER_CPU_THREADS,
+    LOCAL_WHISPER_NUM_WORKERS: process.env.LOCAL_WHISPER_NUM_WORKERS,
+    LOCAL_WHISPER_BEAM_SIZE: process.env.LOCAL_WHISPER_BEAM_SIZE || "5",
+    LOCAL_WHISPER_BEST_OF: process.env.LOCAL_WHISPER_BEST_OF || "5",
+    LOCAL_WHISPER_VAD_FILTER: process.env.LOCAL_WHISPER_VAD_FILTER,
+  };
+  return Object.entries(values)
+    .filter(([, value]) => cleanString(value))
+    .map(([key, value]) => `${key}=${shellQuote(value)}`)
+    .join(" ");
+}
+
+function buildLocalWhisperEnv() {
+  const env = { ...process.env };
+  const libraryPath = cleanString(LOCAL_WHISPER_LIBRARY_PATH);
+  if (libraryPath) {
+    env.LD_LIBRARY_PATH = mergeLibraryPath(libraryPath, env.LD_LIBRARY_PATH);
+  }
+  return env;
+}
+
+function buildCpuWhisperEnv() {
+  const env = buildLocalWhisperEnv();
+  env.LOCAL_WHISPER_DEVICE = "cpu";
+  env.LOCAL_WHISPER_COMPUTE_TYPE = "float32";
+  return env;
+}
+
+function buildRemoteWhisperLibraryPath() {
+  const libraryPath = cleanString(REMOTE_WHISPER_LIBRARY_PATH || LOCAL_WHISPER_LIBRARY_PATH);
+  return libraryPath ? mergeLibraryPath(libraryPath, "") : "";
+}
+
+function isCudaRuntimeError(error) {
+  const message = String(error?.message || error || "");
+  return /cuda/i.test(message)
+    || /driver\/library version mismatch/i.test(message)
+    || /forward compatibility was attempted/i.test(message)
+    || /failed to initialize nvml/i.test(message);
+}
+
+function markLessonRemoteFallback(chunks, error) {
+  const lessonId = chunks.find((chunk) => chunk?.lesson_id)?.lesson_id;
+  const lesson = findLesson(lessonId);
+  if (lesson) {
+    lesson.transcribe_backend = "remote";
+    lesson.error_message = "";
+    lesson.updated_at = nowIso();
+  }
+  console.warn(`本机 CUDA 显存不足，已自动切换远程转写: ${String(error?.message || error).slice(0, 300)}`);
+}
+
+function markLessonLocalFallback(chunks, error) {
+  const lessonId = chunks.find((chunk) => chunk?.lesson_id)?.lesson_id;
+  const lesson = findLesson(lessonId);
+  if (lesson) {
+    lesson.transcribe_backend = "local";
+    lesson.error_message = "";
+    lesson.updated_at = nowIso();
+  }
+  console.warn(`远程转写不可用，已自动切换本机转写: ${String(error?.message || error).slice(0, 300)}`);
+}
+
+function markLessonCpuFallback(chunks, error) {
+  const lessonId = chunks.find((chunk) => chunk?.lesson_id)?.lesson_id;
+  const lesson = findLesson(lessonId);
+  if (lesson) {
+    lesson.transcribe_backend = "local";
+    lesson.error_message = "";
+    lesson.updated_at = nowIso();
+  }
+  console.warn(`已自动切换本机 CPU/float32 转写: ${String(error?.message || error).slice(0, 300)}`);
+}
+
+function combineFallbackErrors(errors) {
+  const message = errors
+    .filter(Boolean)
+    .map((error, index) => `尝试 ${index + 1}: ${String(error?.message || error).slice(0, 500)}`)
+    .join("\n");
+  return new Error(message || "转写失败");
+}
+
+function mergeLibraryPath(prefix, existing) {
+  return [prefix, existing].map(cleanString).filter(Boolean).join(":");
+}
+
+function shellQuote(value) {
+  return `'${String(value).replace(/'/g, "'\\''")}'`;
 }
 
 function findOnPath(binary) {
@@ -2511,7 +3072,19 @@ function isLocalLlmFeedbackEnabled() {
 function isLocalAiEnabled() {
   return AI_PROVIDER === "local"
     && fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT)
-    && fs.existsSync(LOCAL_DEP_MARKER);
+    && (fs.existsSync(LOCAL_DEP_MARKER) || isRemoteTranscribeConfigured());
+}
+
+function isLocalTranscribeAvailable() {
+  return fs.existsSync(LOCAL_TRANSCRIBE_SCRIPT) && fs.existsSync(LOCAL_DEP_MARKER);
+}
+
+function isRemoteTranscribeConfigured() {
+  return REMOTE_TRANSCRIBE_ENABLED
+    && Boolean(REMOTE_TRANSCRIBE_HOST)
+    && Boolean(REMOTE_TRANSCRIBE_USER)
+    && Boolean(REMOTE_TRANSCRIBE_PASSWORD)
+    && Boolean(findOnPath("sshpass"));
 }
 
 function getEffectiveAiMode() {
@@ -2536,6 +3109,10 @@ function getLessonFeedbackStyle(lesson) {
   return validateFeedbackStyle(lesson?.feedback_style, false);
 }
 
+function getLessonTranscribeBackend(lesson) {
+  return validateTranscribeBackend(lesson?.transcribe_backend, false);
+}
+
 function getSelectedLocalLlmModel() {
   const fromSettings = cleanString(db?.settings?.local_llm_model);
   return fromSettings || cleanString(LOCAL_LLM_MODEL);
@@ -2545,9 +3122,12 @@ function validateFeedbackGenerator(value, strict) {
   const candidate = cleanString(value).toLowerCase();
   const normalized = normalizeFeedbackGeneratorValue(candidate);
   if (strict && candidate && !normalized) {
-    throw new Error("不支持的反馈生成方式，只能是 local_llm 或 openai_llm。");
+    throw new Error("不支持的反馈生成方式，只能是 none、local_llm 或 openai_llm。");
   }
   const resolved = normalized || getSafeDefaultFeedbackGenerator();
+  if (resolved === "none") {
+    return resolved;
+  }
   if (getEffectiveAiMode() !== "mock" && !isFeedbackGeneratorAvailable(resolved)) {
     if (strict) {
       throw new Error(feedbackGeneratorUnavailableMessage(resolved));
@@ -2555,6 +3135,38 @@ function validateFeedbackGenerator(value, strict) {
     return pickAvailableFeedbackGenerator() || resolved;
   }
   return resolved;
+}
+
+function validateTranscribeBackend(value, strict) {
+  const candidate = cleanString(value).toLowerCase();
+  if (candidate === "local") {
+    if (isLocalTranscribeAvailable() || !isRemoteTranscribeConfigured()) {
+      return "local";
+    }
+    if (strict) {
+      throw new Error("本机转写依赖不可用。");
+    }
+    return "remote";
+  }
+  if (candidate === "remote") {
+    if (isRemoteTranscribeConfigured()) {
+      return "remote";
+    }
+    if (strict) {
+      throw new Error("远程转写未配置或 sshpass 不可用。");
+    }
+    return isLocalTranscribeAvailable() ? "local" : "remote";
+  }
+  if (strict && candidate) {
+    throw new Error("不支持的转写位置，只能是 local 或 remote。");
+  }
+  if (DEFAULT_TRANSCRIBE_BACKEND === "remote" && isRemoteTranscribeConfigured()) {
+    return "remote";
+  }
+  if (isLocalTranscribeAvailable()) {
+    return "local";
+  }
+  return isRemoteTranscribeConfigured() ? "remote" : "local";
 }
 
 function getSafeDefaultFeedbackGenerator() {
@@ -2565,6 +3177,9 @@ function getSafeDefaultFeedbackGenerator() {
 
 function normalizeFeedbackGeneratorValue(value) {
   const candidate = cleanString(value).toLowerCase();
+  if (candidate === "none" || candidate === "transcript_only") {
+    return "none";
+  }
   if (candidate === "local_llm" || candidate === "openai_llm") {
     return candidate;
   }
@@ -2599,36 +3214,36 @@ function getFeedbackStyleSpec(style) {
   const map = {
     professional_warm: {
       label: "专业温和",
-      lengthRule: "字数控制在 300-420 字，完整但不要冗长。",
+      lengthRule: "字数控制在 500-700 字，完整但不要冗长。",
       instructions: [
         "语气要像认真负责的任课老师，克制、稳定、尊重家长，不夸张。",
-        "结构贴近老师平时发给家长的课后反馈：先总述本节课内容，再写掌握得较好的部分，最后写还需要加强的部分。",
+        "结构必须使用问候、主要内容包括、掌握得较好的部分、还需要加强的部分、整体来看。",
         "“主要内容包括”后的编号内容要精炼，像题型和方法总结，不要写成课堂逐分钟记录。",
         "亮点和问题都要写得具体，像老师课后复盘，不要写空泛表扬或生硬结论。",
         "指出问题时要温和、具体，多用“还不够熟练”“有些疑惑”“没有马上想起来”这类表达，避免情绪化表达和过度批评。",
-        "建议和下节课计划自然落在最后一段，不要单独再起“改进策略”清单。",
+        "建议和后续复盘重点自然落在“整体来看”里，不要单独再起“改进策略”清单。",
       ],
     },
     concise: {
       label: "简洁版",
-      lengthRule: "整体控制在 240-320 字，尽量短，但关键信息不能缺。",
+      lengthRule: "字数控制在 500-700 字，在这个范围内尽量简洁。",
       instructions: [
-        "整体更短，尽量控制在 240-320 字，信息密度高，不铺陈。",
-        "仍保持“总述本节课内容 -> 掌握得较好的部分 -> 还需要加强的部分”的三段结构。",
-        "“主要内容包括”控制在 3-4 条，只保留最关键的题型和方法。",
-        "每段只保留关键事实和最重要的建议，减少客套话和重复解释。",
+        "在 500-700 字范围内尽量简洁，信息密度高，不铺陈。",
+        "仍保持问候、主要内容包括、掌握得较好的部分、还需要加强的部分、整体来看这套结构。",
+        "“主要内容包括”优先写 5 条，只保留最关键的题型和方法。",
+        "每段保留关键事实和最重要的建议，减少客套话和重复解释。",
         "语气仍要专业清晰，但不要写成长篇说明。",
         "适合老师快速同步课堂情况给家长，但不要因为求短而写成机械提纲。",
       ],
     },
     wechat: {
       label: "微信口吻",
-      lengthRule: "字数控制在 280-380 字，读起来像一条自然的微信消息。",
+      lengthRule: "字数控制在 500-700 字，读起来像一条自然的微信消息。",
       instructions: [
         "语气更自然、更口语化，像老师在微信里单独发消息，不要生硬公文腔。",
         "保持礼貌和边界感，不要使用网络流行语，不要太随便。",
         "表达要更顺口，可以适度加入“今天这节课”“这边看下来”这类老师微信里常见说法。",
-        "仍然保持三段结构，但段落之间要更自然，像老师手动输入的一条消息。",
+        "仍然保持问候、主要内容包括、掌握得较好的部分、还需要加强的部分、整体来看这套结构，但段落之间要更自然。",
         "不要写成任务汇报或会议纪要，尤其不要再单独列“改进策略”清单。",
       ],
     },
@@ -2637,7 +3252,9 @@ function getFeedbackStyleSpec(style) {
 }
 
 function isFeedbackGeneratorAvailable(generator) {
-  return generator === "local_llm"
+  return generator === "none"
+    ? true
+    : generator === "local_llm"
     ? isLocalLlmFeedbackEnabled()
     : generator === "openai_llm"
       ? isOpenAiFeedbackEnabled()
@@ -2661,7 +3278,9 @@ function feedbackGeneratorUnavailableMessage(generator) {
 }
 
 function getFeedbackModelName(generator) {
-  return generator === "local_llm"
+  return generator === "none"
+    ? "不生成反馈"
+    : generator === "local_llm"
     ? getSelectedLocalLlmModel() || "未配置"
     : OPENAI_CHAT_MODEL;
 }
@@ -2688,9 +3307,47 @@ function getFeedbackBackendSummary(localLlmInfo = null) {
   return values.join(" / ") || "未配置反馈 LLM";
 }
 
+function getRemoteTranscribeSummary() {
+  if (!isRemoteTranscribeConfigured()) {
+    return "";
+  }
+  const host = REMOTE_TRANSCRIBE_PORT === 22
+    ? REMOTE_TRANSCRIBE_HOST
+    : `${REMOTE_TRANSCRIBE_HOST}:${REMOTE_TRANSCRIBE_PORT}`;
+  return `${REMOTE_TRANSCRIBE_USER}@${host}`;
+}
+
+function getTranscribeBackendSummary(defaultBackend) {
+  const values = [];
+  const runtime = getWhisperRuntimeSummary();
+  if (isLocalTranscribeAvailable()) {
+    values.push(`本机 faster-whisper（${runtime}）`);
+  } else if (AI_PROVIDER === "local") {
+    values.push("本机 faster-whisper（未就绪）");
+  }
+  const remoteSummary = getRemoteTranscribeSummary();
+  if (remoteSummary) {
+    values.push(`远程 ${remoteSummary}（${runtime}）`);
+  }
+  const suffix = defaultBackend === "remote" ? "，默认远程" : "，默认本机";
+  return values.length > 0 ? `${values.join(" / ")}${suffix}` : "未配置真实转写";
+}
+
+function getWhisperRuntimeSummary() {
+  const device = cleanString(process.env.LOCAL_WHISPER_DEVICE || "cpu");
+  const computeType = cleanString(process.env.LOCAL_WHISPER_COMPUTE_TYPE || "int8");
+  return `${device}/${computeType}`;
+}
+
 function migrateLegacyFeedbackGenerators() {
   let changed = false;
   for (const lesson of db.lessons) {
+    const backend = validateTranscribeBackend(lesson.transcribe_backend, false);
+    if (lesson.transcribe_backend !== backend) {
+      lesson.transcribe_backend = backend;
+      lesson.updated_at = lesson.updated_at || nowIso();
+      changed = true;
+    }
     const normalized = validateFeedbackGenerator(lesson.feedback_generator, false);
     if (lesson.feedback_generator !== normalized) {
       lesson.feedback_generator = normalized;
@@ -2766,6 +3423,14 @@ function sanitizeModelText(value) {
 function positiveNumber(value) {
   const number = Number(value);
   return Number.isFinite(number) && number > 0 ? Math.round(number) : null;
+}
+
+function clampInteger(value, fallback, min, max) {
+  const number = Math.round(Number(value));
+  if (!Number.isFinite(number)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, number));
 }
 
 function safeFilename(value) {

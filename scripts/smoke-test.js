@@ -49,6 +49,10 @@ async function runMainFlow() {
       notes: "冒烟测试",
     });
     assert(studentResult.student.id, "学生创建失败");
+    const renamedStudent = await apiPut(`/api/students/${studentResult.student.id}`, {
+      name: "测试学生改名",
+    });
+    assert(renamedStudent.student.name === "测试学生改名", "学生改名失败");
 
     const lessonResult = await apiPost("/api/lessons", {
       student_id: studentResult.student.id,
@@ -57,6 +61,10 @@ async function runMainFlow() {
     });
     assert(lessonResult.lesson.id, "课程创建失败");
     assert(lessonResult.lesson.feedback_generator === "local_llm", "默认反馈生成方式不正确");
+    const renamedLesson = await apiPut(`/api/lessons/${lessonResult.lesson.id}`, {
+      lesson_title: "导数综合题训练改名",
+    });
+    assert(renamedLesson.lesson.lesson_title === "导数综合题训练改名", "课程改名失败");
 
     const preferences = await apiPut(`/api/lessons/${lessonResult.lesson.id}/preferences`, {
       feedback_generator: "local_llm",
@@ -79,13 +87,79 @@ async function runMainFlow() {
     const payload = await pollLesson(lessonResult.lesson.id);
     assert(payload.lesson.status === "feedback_generated", `课程没有完成: ${payload.lesson.status}`);
     assert(payload.status.total_chunks === 3, `应按 5 分钟虚拟切为 3 段，实际 ${payload.status.total_chunks}`);
-    assert(payload.lesson.full_transcript.includes("导数综合题训练"), "转写稿没有合并课程信息");
+    assert(payload.lesson.full_transcript.includes("导数综合题训练改名"), "转写稿没有合并课程信息");
     assert(payload.lesson.feedback_text.includes("今天这节课"), "反馈生成失败");
 
     const saved = await apiPut(`/api/lessons/${lessonResult.lesson.id}/feedback`, {
       teacher_edited_feedback: `${payload.lesson.feedback_text}\n老师已审核。`,
     });
     assert(saved.lesson.teacher_edited_feedback.includes("老师已审核"), "反馈保存失败");
+
+    const transcriptOnlyLesson = await apiPost("/api/lessons", {
+      student_id: studentResult.student.id,
+      lesson_title: "只生成文字版测试",
+      lesson_time: "2026-05-06T19:00:00",
+    });
+    const transcriptOnlyPreferences = await apiPut(`/api/lessons/${transcriptOnlyLesson.lesson.id}/preferences`, {
+      feedback_generator: "none",
+    });
+    assert(transcriptOnlyPreferences.lesson.feedback_generator === "none", "只生成文字版偏好保存失败");
+
+    const transcriptOnlyUpload = await fetch(`${BASE_URL}/api/lessons/${transcriptOnlyLesson.lesson.id}/recording`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "audio/wav",
+        "X-File-Name": encodeURIComponent("transcript-only.wav"),
+        "X-File-Format": "audio/wav",
+        "X-Audio-Duration-Sec": "120",
+      },
+      body: Buffer.from("mock audio bytes for transcript only"),
+    });
+    assert(transcriptOnlyUpload.status === 201, `只生成文字版上传失败: ${transcriptOnlyUpload.status} ${await transcriptOnlyUpload.text()}`);
+
+    const transcriptOnlyPayload = await pollLesson(transcriptOnlyLesson.lesson.id);
+    assert(transcriptOnlyPayload.lesson.status === "completed", `只生成文字版没有完成: ${transcriptOnlyPayload.lesson.status}`);
+    assert(transcriptOnlyPayload.lesson.full_transcript.includes("只生成文字版测试"), "只生成文字版没有保留转写稿");
+    assert(!transcriptOnlyPayload.lesson.feedback_text, "只生成文字版不应生成反馈");
+
+    const feedbackOnlyStart = await apiPost(`/api/lessons/${transcriptOnlyLesson.lesson.id}/regenerate-feedback`, {
+      style: "professional_warm",
+      length: "medium",
+      feedback_generator: "local_llm",
+    });
+    assert(feedbackOnlyStart.status === "summarizing", "只生成课后反馈没有进入生成状态");
+    const feedbackOnlyPayload = await pollLesson(transcriptOnlyLesson.lesson.id);
+    assert(feedbackOnlyPayload.lesson.status === "feedback_generated", `只生成课后反馈没有完成: ${feedbackOnlyPayload.lesson.status}`);
+    assert(feedbackOnlyPayload.lesson.feedback_text.includes("妈妈您好"), "只生成课后反馈没有使用家长反馈结构");
+    assert(feedbackOnlyPayload.lesson.full_transcript.includes("只生成文字版测试"), "只生成课后反馈不应清空录音文字版");
+
+    const twoPartLesson = await apiPost("/api/lessons", {
+      student_id: studentResult.student.id,
+      lesson_title: "两段录音测试",
+      lesson_time: "2026-05-07T19:00:00",
+    });
+    const batchId = `smoke-${Date.now()}`;
+    for (const part of [1, 2]) {
+      const response = await fetch(`${BASE_URL}/api/lessons/${twoPartLesson.lesson.id}/recording`, {
+        method: "POST",
+        headers: {
+          "Content-Type": "audio/wav",
+          "X-File-Name": encodeURIComponent(`two-part-${part}.wav`),
+          "X-File-Format": "audio/wav",
+          "X-Audio-Duration-Sec": "120",
+          "X-Recording-Batch-Id": batchId,
+          "X-Recording-Order": String(part),
+          "X-Recording-Total": "2",
+        },
+        body: Buffer.from(`mock audio bytes for part ${part}`),
+      });
+      assert(response.status === 201, `第 ${part} 段上传失败: ${response.status} ${await response.text()}`);
+    }
+    const twoPartPayload = await pollLesson(twoPartLesson.lesson.id);
+    assert(twoPartPayload.lesson.status === "feedback_generated", `两段录音没有完成: ${twoPartPayload.lesson.status}`);
+    assert(twoPartPayload.status.total_chunks === 2, `两段录音应产生 2 个虚拟切片，实际 ${twoPartPayload.status.total_chunks}`);
+    assert(twoPartPayload.lesson.full_transcript.includes("第1段录音"), "合并转写稿缺少第一段录音标记");
+    assert(twoPartPayload.lesson.full_transcript.includes("第2段录音"), "合并转写稿缺少第二段录音标记");
 
   } finally {
     server.kill("SIGTERM");

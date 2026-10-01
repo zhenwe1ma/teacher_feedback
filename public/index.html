@@ -96,15 +96,31 @@
                 <div class="privacy-note">
                   请确认你已获得必要授权。本系统会将课堂录音用于转写和生成课后反馈。录音文件和转写文本仅用于课程总结，不会公开展示。
                 </div>
-                <div id="dropZone" class="drop-zone">
-                  <span>点击或拖拽录音到这里上传</span>
-                  <input id="audioInput" class="drop-zone-input" type="file" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg" aria-label="选择课堂录音文件" />
+                <div id="dropZone" class="recording-picker-grid">
+                  <label class="recording-picker">
+                    <span>第 1 段录音</span>
+                    <strong>选择第一段</strong>
+                    <input id="audioInput" class="recording-picker-input" type="file" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg" aria-label="选择第一段课堂录音文件" multiple />
+                  </label>
+                  <label class="recording-picker">
+                    <span>第 2 段录音（可选）</span>
+                    <strong>选择第二段</strong>
+                    <input id="secondAudioInput" class="recording-picker-input" type="file" accept="audio/*,video/mp4,.m4a,.mp3,.wav,.webm,.ogg" aria-label="选择第二段课堂录音文件" />
+                  </label>
                 </div>
                 <div id="fileMeta" class="file-meta"></div>
                 <audio id="audioPreview" controls class="hidden"></audio>
               </section>
 
               <aside class="surface settings-surface">
+                <div class="settings-block">
+                  <span class="field-label">语音转文字位置</span>
+                  <select id="transcribeBackendSelect">
+                    <option value="local">本机转写</option>
+                    <option value="remote">远程转写</option>
+                  </select>
+                  <p id="transcribeBackendHint" class="subtle model-hint"></p>
+                </div>
                 <div class="settings-block">
                   <span class="field-label">反馈生成方式</span>
                   <select id="feedbackGeneratorSelect">
@@ -130,7 +146,9 @@
                   <p class="field-hint">首次自动生成和重新生成都会使用这个风格</p>
                 </div>
                 <div class="upload-actions">
-                  <button id="uploadButton" type="button" disabled>上传并处理</button>
+                  <button id="transcriptOnlyUploadButton" class="secondary-button" type="button" disabled>只生成录音文字版</button>
+                  <button id="uploadButton" type="button" disabled>生成文字与反馈</button>
+                  <button id="generateFeedbackButton" class="secondary-button" type="button" disabled>生成课后反馈</button>
                 </div>
               </aside>
             </div>

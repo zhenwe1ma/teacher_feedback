@@ -11,7 +11,9 @@ const state = {
   selectedLessonId: null,
   lessonPayload: null,
   selectedFile: null,
+  selectedFiles: [],
   selectedFileDuration: null,
+  selectedFileDurations: [],
   pollTimer: null,
 };
 
@@ -38,12 +40,17 @@ const el = {
   currentLessonTitle: document.getElementById("currentLessonTitle"),
   deleteLessonButton: document.getElementById("deleteLessonButton"),
   audioInput: document.getElementById("audioInput"),
+  secondAudioInput: document.getElementById("secondAudioInput"),
   fileMeta: document.getElementById("fileMeta"),
+  transcribeBackendSelect: document.getElementById("transcribeBackendSelect"),
+  transcribeBackendHint: document.getElementById("transcribeBackendHint"),
   feedbackGeneratorSelect: document.getElementById("feedbackGeneratorSelect"),
   localModelSelect: document.getElementById("localModelSelect"),
   switchLocalModelButton: document.getElementById("switchLocalModelButton"),
   localModelHint: document.getElementById("localModelHint"),
+  transcriptOnlyUploadButton: document.getElementById("transcriptOnlyUploadButton"),
   uploadButton: document.getElementById("uploadButton"),
+  generateFeedbackButton: document.getElementById("generateFeedbackButton"),
   audioPreview: document.getElementById("audioPreview"),
   progressText: document.getElementById("progressText"),
   chunkText: document.getElementById("chunkText"),
@@ -94,11 +101,15 @@ function bindEvents() {
   el.lessonForm.addEventListener("submit", onCreateLesson);
   el.lessonSearchInput.addEventListener("input", onLessonSearchChanged);
   el.audioInput.addEventListener("change", onFileSelected);
+  el.secondAudioInput.addEventListener("change", onFileSelected);
+  el.transcribeBackendSelect.addEventListener("change", onChangeTranscribeBackend);
   el.feedbackGeneratorSelect.addEventListener("change", onChangeFeedbackGenerator);
   el.localModelSelect.addEventListener("change", onLocalModelSelectionChanged);
   el.styleSelect.addEventListener("change", onChangeFeedbackStyle);
   el.switchLocalModelButton.addEventListener("click", onSwitchLocalModel);
-  el.uploadButton.addEventListener("click", onUploadRecording);
+  el.transcriptOnlyUploadButton.addEventListener("click", () => onUploadRecording("transcript_only"));
+  el.uploadButton.addEventListener("click", () => onUploadRecording("with_feedback"));
+  el.generateFeedbackButton.addEventListener("click", () => onGenerateFeedbackOnly("generate"));
   el.copyTranscriptButton.addEventListener("click", onCopyTranscript);
   el.saveFeedbackButton.addEventListener("click", onSaveFeedback);
   el.copyButton.addEventListener("click", onCopyFeedback);
@@ -155,12 +166,14 @@ function renderConfig() {
     el.modeBadge.textContent = `音频转写：${config.transcribeModel}；反馈：${feedbackText}`;
   } else if (config.effectiveAiMode === "local") {
     const ffmpegText = config.ffmpegAvailable ? "ffmpeg 可用" : "未检测到 ffmpeg";
-    el.modeBadge.textContent = `本地转写：${config.transcribeModel}；反馈：${feedbackText}；${ffmpegText}`;
+    const transcribeText = config.transcribeBackendSummary || `本地转写：${config.transcribeModel}`;
+    el.modeBadge.textContent = `语音转文字：${transcribeText}；反馈：${feedbackText}；${ffmpegText}`;
   } else {
     const ffmpegText = config.ffmpegAvailable ? "ffmpeg 可用" : "未检测到 ffmpeg";
     el.modeBadge.textContent = `无费用演示模式：不会调用外部 API，反馈生成走 mock，${ffmpegText}`;
   }
   renderAccessLinks();
+  renderTranscribeBackendControl(state.lessonPayload?.lesson || null);
   renderLocalModelControls(state.lessonPayload?.lesson || null);
 }
 
@@ -191,23 +204,40 @@ function renderStudents() {
   for (const student of filtered) {
     const item = document.createElement("div");
     item.className = `list-item student-list-item ${student.id === state.selectedStudentId ? "active" : ""}`;
+    item.tabIndex = 0;
+    item.setAttribute("role", "button");
+    item.setAttribute("aria-label", `选择${student.name}`);
     item.innerHTML = `
-      <button class="student-select-button" type="button">
-        <div class="list-card">
-          <span class="avatar-chip">${escapeHtml(getAvatarText(student.name))}</span>
-          <div class="list-card-main">
-            <div class="item-row">
-              <strong>${escapeHtml(student.name)}</strong>
-              <span class="subtle">${escapeHtml(student.grade || "")}</span>
-            </div>
-            <span class="subtle">${escapeHtml(student.notes || "无备注")}</span>
+      <div class="list-card">
+        <span class="avatar-chip">${escapeHtml(getAvatarText(student.name))}</span>
+        <div class="list-card-main">
+          <div class="item-row">
+            <button class="inline-edit-button student-name-edit" type="button" title="点击修改学生姓名" aria-label="修改${escapeHtml(student.name)}的姓名">${escapeHtml(student.name)}</button>
+            <span class="subtle">${escapeHtml(student.grade || "")}</span>
           </div>
+          <span class="subtle">${escapeHtml(student.notes || "无备注")}</span>
         </div>
-      </button>
-      <button class="student-copy-button" type="button" title="复制姓名" aria-label="复制${escapeHtml(student.name)}的姓名">复制</button>
+      </div>
+      <div class="student-actions">
+        <button class="student-copy-button" type="button" title="复制姓名" aria-label="复制${escapeHtml(student.name)}的姓名">复制</button>
+      </div>
     `;
-    item.querySelector(".student-select-button").addEventListener("click", () => selectStudent(student.id));
-    item.querySelector(".student-copy-button").addEventListener("click", () => onCopyStudentName(student.name));
+    item.addEventListener("click", () => selectStudent(student.id));
+    item.addEventListener("keydown", (event) => {
+      if (event.target !== item || !isKeyboardActivation(event)) {
+        return;
+      }
+      event.preventDefault();
+      selectStudent(student.id);
+    });
+    item.querySelector(".student-name-edit").addEventListener("click", (event) => {
+      event.stopPropagation();
+      onRenameStudent(student.id);
+    });
+    item.querySelector(".student-copy-button").addEventListener("click", (event) => {
+      event.stopPropagation();
+      onCopyStudentName(student.name);
+    });
     el.studentsList.append(item);
   }
 }
@@ -257,13 +287,15 @@ function renderLessons() {
     return;
   }
   for (const lesson of filtered) {
-    const button = document.createElement("button");
-    button.type = "button";
-    button.className = `list-item ${lesson.id === state.selectedLessonId ? "active" : ""}`;
-    button.innerHTML = `
+    const item = document.createElement("div");
+    item.className = `list-item lesson-list-item ${lesson.id === state.selectedLessonId ? "active" : ""}`;
+    item.tabIndex = 0;
+    item.setAttribute("role", "button");
+    item.setAttribute("aria-label", `选择${lesson.lesson_title}`);
+    item.innerHTML = `
       <div class="list-card-main">
         <div class="item-row">
-          <strong>${escapeHtml(lesson.lesson_title)}</strong>
+          <button class="inline-edit-button lesson-title-edit" type="button" title="点击修改课程名称" aria-label="修改${escapeHtml(lesson.lesson_title)}的课程名称">${escapeHtml(lesson.lesson_title)}</button>
           <span class="status-pill ${lesson.status === "failed" ? "failed" : ""}">${labelStatus(lesson.status)}</span>
         </div>
         <div class="lesson-meta-row">
@@ -272,8 +304,19 @@ function renderLessons() {
         </div>
       </div>
     `;
-    button.addEventListener("click", () => selectLesson(lesson.id));
-    el.lessonsList.append(button);
+    item.addEventListener("click", () => selectLesson(lesson.id));
+    item.addEventListener("keydown", (event) => {
+      if (event.target !== item || !isKeyboardActivation(event)) {
+        return;
+      }
+      event.preventDefault();
+      selectLesson(lesson.id);
+    });
+    item.querySelector(".lesson-title-edit").addEventListener("click", (event) => {
+      event.stopPropagation();
+      onRenameLesson(lesson.id);
+    });
+    el.lessonsList.append(item);
   }
 }
 
@@ -294,6 +337,7 @@ function renderLessonDetail(payload) {
     el.lessonDetail.classList.add("hidden");
     el.lessonStatusPill.textContent = "未选择";
     el.lessonStatusPill.classList.remove("failed");
+    renderTranscribeBackendControl(null);
     renderFeedbackGenerator(null);
     renderLocalModelControls(null);
     renderTranscript(null);
@@ -302,7 +346,7 @@ function renderLessonDetail(payload) {
     return;
   }
 
-  const { lesson, status, recording } = payload;
+  const { lesson, status, recording, recordings } = payload;
   el.emptyState.classList.add("hidden");
   el.lessonDetail.classList.remove("hidden");
   el.currentLessonTitle.textContent = lesson.lesson_title;
@@ -318,13 +362,50 @@ function renderLessonDetail(payload) {
   el.errorMessage.textContent = status.error_message || "";
 
   renderChunks(status.chunks || []);
-  renderRecording(recording);
+  renderRecording(recording, recordings || []);
+  renderTranscribeBackendControl(lesson);
   renderFeedbackGenerator(lesson);
   renderLocalModelControls(lesson);
   renderFeedbackStyleControl(lesson);
   renderTranscript(payload);
   renderFeedback(lesson);
   syncUploadControls();
+}
+
+function renderTranscribeBackendControl(lesson) {
+  const config = state.config || {};
+  const localMode = config.effectiveAiMode === "local";
+  const localEnabled = localMode && Boolean(config.localWhisperAvailable);
+  const remoteEnabled = localMode && Boolean(config.remoteTranscribeConfigured);
+  const savedBackend = lesson?.transcribe_backend || config.defaultTranscribeBackend || "local";
+  const localOption = el.transcribeBackendSelect.querySelector('option[value="local"]');
+  const remoteOption = el.transcribeBackendSelect.querySelector('option[value="remote"]');
+
+  if (localOption) {
+    localOption.disabled = !localEnabled;
+    localOption.textContent = localEnabled ? "本机转写" : "本机转写（未就绪）";
+  }
+  if (remoteOption) {
+    remoteOption.disabled = !remoteEnabled;
+    remoteOption.textContent = remoteEnabled ? "远程转写" : "远程转写（未配置）";
+  }
+
+  el.transcribeBackendSelect.disabled = !lesson || !localMode || (!localEnabled && !remoteEnabled);
+  el.transcribeBackendSelect.value = savedBackend === "remote" ? "remote" : "local";
+
+  if (!localMode) {
+    el.transcribeBackendHint.textContent = config.effectiveAiMode === "openai"
+      ? "当前音频转写由 OpenAI 兼容接口完成"
+      : "当前是无费用演示模式，不会调用真实语音转文字";
+  } else if (el.transcribeBackendSelect.value === "remote") {
+    el.transcribeBackendHint.textContent = remoteEnabled
+      ? `远程机器：${config.remoteTranscribeSummary || config.remoteTranscribeHost || "已配置"}`
+      : "远程转写未配置";
+  } else {
+    el.transcribeBackendHint.textContent = localEnabled
+      ? "本机 faster-whisper：可用"
+      : "本机 faster-whisper：未就绪";
+  }
 }
 
 function renderFeedbackGenerator(lesson) {
@@ -356,6 +437,7 @@ function renderFeedbackGenerator(lesson) {
     el.feedbackGeneratorSelect.value = "openai_llm";
   }
   el.regenerateButton.disabled = !lesson || !hasAnyEnabled;
+  syncGenerateFeedbackButton();
 }
 
 function renderAccessLinks() {
@@ -378,7 +460,9 @@ function renderLocalModelControls(lesson) {
     ? config.localLlmAvailableModels.filter((item) => String(item || "").trim())
     : [];
   const options = models.length ? models : (selectedModel ? [selectedModel] : []);
-  const usingLocalGenerator = lesson?.feedback_generator === "local_llm";
+  const usingLocalGenerator = (lesson?.feedback_generator === "none"
+    ? el.feedbackGeneratorSelect.value
+    : lesson?.feedback_generator) === "local_llm";
   el.localModelSelect.innerHTML = "";
   if (!options.length) {
     const option = document.createElement("option");
@@ -428,10 +512,13 @@ function renderChunks(chunks) {
     const retryButton = chunk.transcription_status === "failed" && chunk.retry_count < 3
       ? `<button type="button" data-retry="${chunk.id}">重试</button>`
       : "";
+    const chunkLabel = chunks.some((item) => item.recording_order > 1)
+      ? `第 ${chunk.recording_order || 1} 段录音 · 第 ${chunk.chunk_index} 个切片`
+      : `第 ${chunk.chunk_index} 段`;
     card.innerHTML = `
-      <strong>第 ${chunk.chunk_index} 段 · ${labelStatus(chunk.transcription_status)}</strong>
+      <strong>${chunkLabel} · ${labelStatus(chunk.transcription_status)}</strong>
       <span>${formatSeconds(chunk.start_time_sec)} - ${formatSeconds(chunk.end_time_sec)}</span>
-      <span class="subtle">重试 ${chunk.retry_count || 0} 次${chunk.virtual ? " · 虚拟切片" : ""}</span>
+      <span class="subtle">失败尝试 ${chunk.retry_count || 0} 次${chunk.virtual ? " · 虚拟切片" : ""}</span>
       ${chunk.error_message ? `<span class="error-text">${escapeHtml(chunk.error_message)}</span>` : ""}
       ${retryButton}
     `;
@@ -443,9 +530,9 @@ function renderChunks(chunks) {
   }
 }
 
-function renderRecording(recording) {
+function renderRecording(recording, recordings = []) {
   if (!recording) {
-    if (state.selectedFile) {
+    if (state.selectedFiles.length > 0) {
       renderPendingFileMeta();
       return;
     }
@@ -454,15 +541,20 @@ function renderRecording(recording) {
     el.audioPreview.classList.add("hidden");
     return;
   }
-  const lines = [
-    `已保存：${recording.original_audio_filename || "录音文件"}`,
-    `大小：${formatBytes(recording.original_audio_size)}`,
-    `格式：${recording.original_audio_format || "未知"}`,
-    `时长：${recording.original_audio_duration_sec ? formatSeconds(recording.original_audio_duration_sec) : "未知"}`,
-  ];
+  const ordered = recordings.length > 0 ? recordings : [recording];
+  const lines = ordered.map((item, index) => [
+    `${ordered.length > 1 ? `第 ${item.recording_order || index + 1} 段` : "已保存"}：${item.original_audio_filename || "录音文件"}`,
+    `大小：${formatBytes(item.original_audio_size)}`,
+    `时长：${item.original_audio_duration_sec ? formatSeconds(item.original_audio_duration_sec) : "未知"}`,
+  ].join(" · "));
   el.fileMeta.innerHTML = lines.map((line) => `<span>${escapeHtml(line)}</span>`).join("");
-  el.audioPreview.src = recording.original_audio_url;
-  el.audioPreview.classList.remove("hidden");
+  if (ordered.length === 1) {
+    el.audioPreview.src = recording.original_audio_url;
+    el.audioPreview.classList.remove("hidden");
+  } else {
+    el.audioPreview.removeAttribute("src");
+    el.audioPreview.classList.add("hidden");
+  }
 }
 
 function renderTranscript(payload) {
@@ -488,7 +580,7 @@ function renderFeedback(lesson) {
   }
   el.styleSelect.disabled = false;
   el.styleSelect.value = lesson.feedback_style || "professional_warm";
-  const ready = ["feedback_generated", "completed", "failed"].includes(lesson.status) && (lesson.feedback_text || lesson.teacher_edited_feedback || lesson.full_transcript);
+  const ready = ["feedback_generated", "completed", "failed"].includes(lesson.status) && (lesson.feedback_text || lesson.teacher_edited_feedback);
   el.feedbackSection.classList.toggle("hidden", !ready);
   renderSummaryCards(lesson.structured_summary || null);
   el.summaryView.textContent = lesson.structured_summary
@@ -551,6 +643,62 @@ async function onDeleteStudent() {
   }
 }
 
+async function onRenameStudent(studentId) {
+  const student = state.students.find((item) => item.id === studentId);
+  if (!student) {
+    return;
+  }
+  const nextName = prompt("请输入新的学生姓名", student.name);
+  if (nextName === null) {
+    return;
+  }
+  const name = nextName.trim();
+  if (!name) {
+    toast("学生姓名不能为空");
+    return;
+  }
+  try {
+    const result = await apiPut(`/api/students/${student.id}`, { name });
+    Object.assign(student, result.student);
+    if (state.lessonPayload?.student?.id === student.id) {
+      state.lessonPayload.student = result.student;
+    }
+    renderStudents();
+    await loadLessons(state.selectedStudentId);
+    toast("学生姓名已修改");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
+async function onRenameLesson(lessonId) {
+  const lesson = state.lessons.find((item) => item.id === lessonId);
+  if (!lesson) {
+    return;
+  }
+  const nextTitle = prompt("请输入新的课程名称", lesson.lesson_title);
+  if (nextTitle === null) {
+    return;
+  }
+  const lessonTitle = nextTitle.trim();
+  if (!lessonTitle) {
+    toast("课程名称不能为空");
+    return;
+  }
+  try {
+    const payload = await apiPut(`/api/lessons/${lesson.id}`, { lesson_title: lessonTitle });
+    Object.assign(lesson, payload.lesson);
+    if (state.selectedLessonId === lesson.id) {
+      state.lessonPayload = payload;
+      renderLessonDetail(payload);
+    }
+    renderLessons();
+    toast("课程名称已修改");
+  } catch (error) {
+    toast(error.message);
+  }
+}
+
 async function onLogout() {
   try {
     await apiPost("/api/auth/logout", {});
@@ -583,61 +731,84 @@ async function onCreateLesson(event) {
   }
 }
 
-async function onFileSelected(event) {
-  const file = event.target.files?.[0];
-  state.selectedFile = file || null;
+async function onFileSelected() {
+  const firstFiles = Array.from(el.audioInput.files || []);
+  const secondFiles = Array.from(el.secondAudioInput.files || []);
+  const files = [firstFiles[0], secondFiles[0] || firstFiles[1]].filter(Boolean);
+  if (firstFiles.length > 2 || secondFiles.length > 1) {
+    toast("最多支持两段录音，已保留前两段");
+  }
+  state.selectedFiles = files;
+  state.selectedFile = files[0] || null;
+  state.selectedFileDurations = new Array(files.length).fill(null);
   state.selectedFileDuration = null;
-  if (!file) {
+  if (files.length === 0) {
     el.fileMeta.textContent = "尚未选择录音文件";
     el.audioPreview.classList.add("hidden");
     syncUploadControls();
     return;
   }
 
-  const objectUrl = URL.createObjectURL(file);
+  const objectUrl = URL.createObjectURL(files[0]);
   el.audioPreview.src = objectUrl;
   el.audioPreview.classList.remove("hidden");
   renderPendingFileMeta();
   syncUploadControls();
 
-  const duration = await readAudioDuration(objectUrl).catch(() => null);
-  if (state.selectedFile !== file) {
-    return;
+  for (let index = 0; index < files.length; index += 1) {
+    const file = files[index];
+    const durationUrl = index === 0 ? objectUrl : URL.createObjectURL(file);
+    const duration = await readAudioDuration(durationUrl).catch(() => null);
+    if (state.selectedFiles[index] !== file) {
+      return;
+    }
+    state.selectedFileDurations[index] = duration;
+    if (index === 0) {
+      state.selectedFileDuration = duration;
+    }
+    renderPendingFileMeta();
   }
-  state.selectedFileDuration = duration;
-  renderPendingFileMeta();
 }
 
-async function onUploadRecording() {
+async function onUploadRecording(mode = "with_feedback") {
   if (!state.selectedLessonId) {
     toast("先选择课程");
     return;
   }
-  if (!state.selectedFile) {
+  if (state.selectedFiles.length === 0) {
     openFilePicker();
     return;
   }
-  el.uploadButton.disabled = true;
-  el.uploadButton.textContent = "上传中";
+  setUploadButtonsState(true, "上传中");
   try {
-    const file = state.selectedFile;
-    const response = await fetch(`/api/lessons/${state.selectedLessonId}/recording`, {
-      method: "POST",
-      headers: {
-        "Content-Type": file.type || "application/octet-stream",
-        "X-File-Name": encodeURIComponent(file.name),
-        "X-File-Format": file.type || extensionOf(file.name),
-        "X-Audio-Duration-Sec": state.selectedFileDuration ? String(Math.round(state.selectedFileDuration)) : "",
-      },
-      body: file,
+    const files = state.selectedFiles.slice(0, 2);
+    const batchId = `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    await apiPut(`/api/lessons/${state.selectedLessonId}/preferences`, {
+      feedback_generator: mode === "transcript_only" ? "none" : el.feedbackGeneratorSelect.value,
     });
-    if (!response.ok) {
-      const error = await response.json().catch(() => ({}));
-      throw new Error(error.error || `上传失败：${response.status}`);
+    for (let index = 0; index < files.length; index += 1) {
+      const file = files[index];
+      const response = await fetch(`/api/lessons/${state.selectedLessonId}/recording`, {
+        method: "POST",
+        headers: {
+          "Content-Type": file.type || "application/octet-stream",
+          "X-File-Name": encodeURIComponent(file.name),
+          "X-File-Format": file.type || extensionOf(file.name),
+          "X-Audio-Duration-Sec": state.selectedFileDurations[index] ? String(Math.round(state.selectedFileDurations[index])) : "",
+          "X-Recording-Batch-Id": batchId,
+          "X-Recording-Order": String(index + 1),
+          "X-Recording-Total": String(files.length),
+        },
+        body: file,
+      });
+      if (!response.ok) {
+        const error = await response.json().catch(() => ({}));
+        throw new Error(error.error || `第 ${index + 1} 段上传失败：${response.status}`);
+      }
     }
     clearPendingFileSelection();
     await selectLesson(state.selectedLessonId);
-    toast("录音已上传");
+    toast(mode === "transcript_only" ? "录音已上传，将只生成文字版" : "录音已上传，将生成文字与反馈");
   } catch (error) {
     toast(error.message);
   } finally {
@@ -664,6 +835,29 @@ async function onChangeFeedbackGenerator(event) {
     toast("反馈生成方式已保存");
   } catch (error) {
     renderFeedbackGenerator(state.lessonPayload?.lesson || null);
+    toast(error.message);
+  }
+}
+
+async function onChangeTranscribeBackend(event) {
+  if (!state.selectedLessonId) {
+    return;
+  }
+  const transcribeBackend = event.target.value;
+  try {
+    const payload = await apiPut(`/api/lessons/${state.selectedLessonId}/preferences`, {
+      transcribe_backend: transcribeBackend,
+    });
+    state.lessonPayload = payload;
+    const existing = state.lessons.find((lesson) => lesson.id === payload.lesson.id);
+    if (existing) {
+      Object.assign(existing, payload.lesson);
+    }
+    renderLessons();
+    renderLessonDetail(payload);
+    toast("语音转文字位置已保存");
+  } catch (error) {
+    renderTranscribeBackendControl(state.lessonPayload?.lesson || null);
     toast(error.message);
   }
 }
@@ -776,9 +970,14 @@ async function onCopyStudentName(name) {
 }
 
 async function onRegenerateFeedback() {
+  await onGenerateFeedbackOnly("regenerate");
+}
+
+async function onGenerateFeedbackOnly(action = "generate") {
   if (!state.selectedLessonId) {
     return;
   }
+  syncGenerateFeedbackButton(true, action === "regenerate" ? "重新生成中" : "生成中");
   try {
     await apiPost(`/api/lessons/${state.selectedLessonId}/regenerate-feedback`, {
       style: el.styleSelect.value,
@@ -786,9 +985,11 @@ async function onRegenerateFeedback() {
       feedback_generator: el.feedbackGeneratorSelect.value,
     });
     await selectLesson(state.selectedLessonId);
-    toast("已开始重新生成");
+    toast(action === "regenerate" ? "已开始重新生成" : "已开始生成课后反馈");
   } catch (error) {
     toast(error.message);
+  } finally {
+    syncGenerateFeedbackButton();
   }
 }
 
@@ -862,53 +1063,106 @@ function syncUploadControls() {
   const lesson = state.lessonPayload?.lesson || null;
   const hasLesson = Boolean(state.selectedLessonId && lesson);
   const busy = Boolean(lesson && ["audio_uploaded", "audio_processing", "transcribing", "transcribed", "summarizing"].includes(lesson.status));
-  const generator = lesson?.feedback_generator || state.config?.defaultFeedbackGenerator || el.feedbackGeneratorSelect.value;
+  const transcribeBackend = lesson?.transcribe_backend || state.config?.defaultTranscribeBackend || el.transcribeBackendSelect.value;
+  const transcribeConfigured = Boolean(state.config) && (
+    state.config.effectiveAiMode !== "local"
+    || (transcribeBackend === "remote" && state.config.remoteTranscribeConfigured)
+    || (transcribeBackend !== "remote" && state.config.localWhisperAvailable)
+  );
+  const generator = lesson?.feedback_generator && lesson.feedback_generator !== "none"
+    ? lesson.feedback_generator
+    : el.feedbackGeneratorSelect.value || state.config?.defaultFeedbackGenerator;
   const feedbackConfigured = Boolean(state.config) && (
     state.config.effectiveAiMode === "mock"
     || (generator === "local_llm" && state.config.localLlmFeedbackAvailable)
     || (generator === "openai_llm" && state.config.openAiLlmFeedbackAvailable)
   );
+
+  setUploadButtonsState(false, "");
+  syncGenerateFeedbackButton(false, "");
   if (!hasLesson) {
-    el.uploadButton.textContent = "先选择课程";
-    el.uploadButton.disabled = true;
+    setUploadButtonsState(true, "先选择课程");
+    syncGenerateFeedbackButton(true, "先选择课程");
     return;
   }
-  if (!feedbackConfigured) {
-    el.uploadButton.textContent = generator === "local_llm" ? "先准备本地模型" : "先配置反馈LLM";
-    el.uploadButton.disabled = true;
+  if (!transcribeConfigured) {
+    setUploadButtonsState(true, transcribeBackend === "remote" ? "先配置远程转写" : "先准备本机转写");
+    syncGenerateFeedbackButton();
     return;
   }
   if (busy) {
-    el.uploadButton.textContent = "处理中";
+    setUploadButtonsState(true, "处理中");
+    syncGenerateFeedbackButton(true, "处理中");
+    return;
+  }
+  if (!feedbackConfigured) {
     el.uploadButton.disabled = true;
+    el.uploadButton.title = generator === "local_llm" ? "先准备本地模型" : "先配置反馈LLM";
+    syncGenerateFeedbackButton(true, el.uploadButton.title);
+  }
+}
+
+function setUploadButtonsState(disabled, reason) {
+  el.transcriptOnlyUploadButton.textContent = "只生成录音文字版";
+  el.uploadButton.textContent = "生成文字与反馈";
+  el.transcriptOnlyUploadButton.disabled = disabled;
+  el.uploadButton.disabled = disabled;
+  el.transcriptOnlyUploadButton.title = reason || (state.selectedFiles.length > 0 ? "" : "先选择录音文件");
+  el.uploadButton.title = reason || (state.selectedFiles.length > 0 ? "" : "先选择录音文件");
+}
+
+function syncGenerateFeedbackButton(forcedDisabled = false, forcedReason = "") {
+  if (!el.generateFeedbackButton) {
     return;
   }
-  if (state.selectedFile) {
-    el.uploadButton.textContent = "上传并处理";
-    el.uploadButton.disabled = false;
-    return;
+  const lesson = state.lessonPayload?.lesson || null;
+  const hasTranscript = Boolean(String(lesson?.full_transcript || "").trim());
+  const generator = lesson?.feedback_generator && lesson.feedback_generator !== "none"
+    ? lesson.feedback_generator
+    : el.feedbackGeneratorSelect.value || state.config?.defaultFeedbackGenerator;
+  const feedbackConfigured = Boolean(state.config) && (
+    state.config.effectiveAiMode === "mock"
+    || (generator === "local_llm" && state.config.localLlmFeedbackAvailable)
+    || (generator === "openai_llm" && state.config.openAiLlmFeedbackAvailable)
+  );
+  const busy = Boolean(lesson && ["audio_uploaded", "audio_processing", "transcribing", "transcribed", "summarizing"].includes(lesson.status));
+  let disabled = forcedDisabled || !lesson || busy || !hasTranscript || !feedbackConfigured;
+  let reason = forcedReason;
+  if (!reason && !lesson) {
+    reason = "先选择课程";
+  } else if (!reason && busy) {
+    reason = "处理中";
+  } else if (!reason && !hasTranscript) {
+    reason = "先生成录音文字版";
+  } else if (!reason && !feedbackConfigured) {
+    reason = generator === "local_llm" ? "先准备本地模型" : "先配置反馈LLM";
   }
-  el.uploadButton.textContent = "选择录音文件";
-  el.uploadButton.disabled = false;
+  el.generateFeedbackButton.textContent = "生成课后反馈";
+  el.generateFeedbackButton.disabled = disabled;
+  el.generateFeedbackButton.title = reason || "根据已有录音文字版生成课后反馈";
 }
 
 function renderPendingFileMeta() {
-  if (!state.selectedFile) {
+  if (state.selectedFiles.length === 0) {
     el.fileMeta.textContent = "尚未选择录音文件";
     return;
   }
-  el.fileMeta.innerHTML = [
-    `文件：${state.selectedFile.name}`,
-    `大小：${formatBytes(state.selectedFile.size)}`,
-    `格式：${state.selectedFile.type || extensionOf(state.selectedFile.name) || "未知"}`,
-    `时长：${state.selectedFileDuration ? formatSeconds(state.selectedFileDuration) : "读取中"}`,
-  ].map((line) => `<span>${escapeHtml(line)}</span>`).join("");
+  el.fileMeta.innerHTML = state.selectedFiles.map((file, index) => [
+    state.selectedFiles.length > 1 ? `第 ${index + 1} 段` : "文件",
+    file.name,
+    formatBytes(file.size),
+    file.type || extensionOf(file.name) || "未知",
+    state.selectedFileDurations[index] ? formatSeconds(state.selectedFileDurations[index]) : "读取中",
+  ].join(" · ")).map((line) => `<span>${escapeHtml(line)}</span>`).join("");
 }
 
 function clearPendingFileSelection() {
   state.selectedFile = null;
+  state.selectedFiles = [];
   state.selectedFileDuration = null;
+  state.selectedFileDurations = [];
   el.audioInput.value = "";
+  el.secondAudioInput.value = "";
 }
 
 function openFilePicker() {
@@ -994,10 +1248,14 @@ function buildTranscriptText(payload) {
     return fullTranscript;
   }
   const chunks = Array.isArray(payload.status?.chunks) ? payload.status.chunks : [];
+  const hasMultipleRecordings = chunks.some((chunk) => Number(chunk.recording_order || 1) > 1);
   const partial = chunks
     .filter((chunk) => chunk.transcript_text)
-    .sort((a, b) => a.chunk_index - b.chunk_index)
-    .map((chunk) => `【${formatSeconds(chunk.start_time_sec)}-${formatSeconds(chunk.end_time_sec)}】\n${chunk.transcript_text}`)
+    .sort((a, b) => (Number(a.recording_order || 1) - Number(b.recording_order || 1)) || (a.chunk_index - b.chunk_index))
+    .map((chunk) => {
+      const prefix = hasMultipleRecordings ? `第${chunk.recording_order || 1}段录音 ` : "";
+      return `【${prefix}${formatSeconds(chunk.start_time_sec)}-${formatSeconds(chunk.end_time_sec)}】\n${chunk.transcript_text}`;
+    })
     .join("\n\n");
   return partial;
 }
@@ -1058,6 +1316,10 @@ function emptyNode(text) {
 
 function labelStatus(status) {
   return STATUS_LABEL[status] || status || "未知";
+}
+
+function isKeyboardActivation(event) {
+  return event.key === "Enter" || event.key === " ";
 }
 
 function formatDateTime(value) {

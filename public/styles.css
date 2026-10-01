@@ -361,8 +361,9 @@ p {
   box-shadow: 0 10px 18px rgba(30, 42, 64, 0.06);
 }
 
-.list-item strong {
-  font-size: 15px;
+.list-item:focus-visible {
+  outline: 2px solid rgba(30, 166, 154, 0.46);
+  outline-offset: 2px;
 }
 
 .student-list-item {
@@ -372,30 +373,29 @@ p {
   overflow: hidden;
 }
 
-.student-select-button {
-  width: 100%;
-  min-height: 86px;
-  border: 0;
-  border-radius: 0;
-  padding: 14px;
-  color: var(--text);
-  background: transparent;
-  box-shadow: none;
-  text-align: left;
+.student-actions {
+  display: grid;
+  gap: 8px;
+  align-self: center;
+  margin-right: 12px;
 }
 
-.student-select-button:hover {
-  color: var(--text);
-  background: transparent;
-  box-shadow: none;
-  transform: none;
+.lesson-list-item {
+  grid-template-columns: minmax(0, 1fr);
+  align-items: stretch;
+  padding: 0;
+  overflow: hidden;
+}
+
+.student-list-item .list-card,
+.lesson-list-item .list-card-main {
+  padding: 14px;
 }
 
 .student-copy-button {
   align-self: center;
   min-width: 56px;
   min-height: 36px;
-  margin-right: 12px;
   border-radius: 9px;
   padding: 0 12px;
   color: #1a5f58;
@@ -407,6 +407,35 @@ p {
 
 .student-copy-button:hover {
   color: #fff;
+}
+
+.inline-edit-button {
+  width: fit-content;
+  max-width: 100%;
+  min-height: 26px;
+  border: 0;
+  border-radius: 6px;
+  padding: 0 4px;
+  color: var(--text);
+  background: transparent;
+  box-shadow: none;
+  font: inherit;
+  font-size: 15px;
+  font-weight: 700;
+  line-height: 1.35;
+  text-align: left;
+}
+
+.inline-edit-button:hover {
+  color: #1a5f58;
+  background: rgba(30, 166, 154, 0.08);
+  box-shadow: none;
+  transform: none;
+}
+
+.inline-edit-button:focus-visible {
+  outline: 2px solid rgba(30, 166, 154, 0.46);
+  outline-offset: 2px;
 }
 
 .list-card {
@@ -541,30 +570,49 @@ p {
   font-size: 13px;
 }
 
-.drop-zone {
+.recording-picker-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.recording-picker {
   position: relative;
   display: grid;
-  place-items: center;
-  min-height: 180px;
+  align-content: center;
+  gap: 8px;
+  min-height: 132px;
   border: 1.5px dashed #b7c7d8;
   border-radius: 16px;
+  padding: 18px;
   background: linear-gradient(180deg, #fbfdff 0%, #f7fbff 100%);
   color: #516174;
   cursor: pointer;
-  text-align: center;
+  text-align: left;
 }
 
-.drop-zone span {
-  max-width: 360px;
+.recording-picker span {
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.recording-picker strong {
+  color: var(--text);
+  font-size: 15px;
   line-height: 1.6;
 }
 
-.drop-zone:focus-within {
+.recording-picker:hover {
+  border-color: rgba(30, 166, 154, 0.5);
+  background: #f7fdfc;
+}
+
+.recording-picker:focus-within {
   outline: 2px solid rgba(30, 166, 154, 0.46);
   outline-offset: 2px;
 }
 
-.drop-zone-input {
+.recording-picker-input {
   position: absolute;
   inset: 0;
   width: 100%;
@@ -573,7 +621,7 @@ p {
   opacity: 0;
 }
 
-.drop-zone-input:focus-visible {
+.recording-picker-input:focus-visible {
   outline: none;
 }
 
@@ -898,6 +946,14 @@ p {
   }
 
   .student-list-item {
+    grid-template-columns: 1fr;
+  }
+
+  .lesson-list-item {
+    grid-template-columns: 1fr;
+  }
+
+  .recording-picker-grid {
     grid-template-columns: 1fr;
   }
 
